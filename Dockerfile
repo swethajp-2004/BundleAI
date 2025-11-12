@@ -44,13 +44,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 
 # Copy application code last to maximize layer cache
 COPY . /app
-# Unzip static assets if present
-RUN if [ -f /app/static.zip ]; then \
-      apt-get update && apt-get install -y --no-install-recommends unzip && \
-      unzip /app/static.zip -d /app/static && \
-      rm /app/static.zip && \
-      rm -rf /var/lib/apt/lists/*; \
-    fi
+
 
 # Create a non-root user (optional but recommended)
 RUN useradd --create-home appuser && chown -R appuser:appuser /app
