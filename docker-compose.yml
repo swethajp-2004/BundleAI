@@ -1,4 +1,5 @@
 version: "3.8"
+
 services:
   app:
     build: .
@@ -8,10 +9,18 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - CHAT_MODEL=${CHAT_MODEL:-gpt-4o-mini}
       - PORT=3000
-      - MAX_ROWS=5000
+      - MAX_ROWS=${MAX_ROWS:-5000}
       - SQL_USER=${SQL_USER}
       - SQL_PASSWORD=${SQL_PASSWORD}
       - SQL_SERVER=${SQL_SERVER}
       - SQL_DATABASE=${SQL_DATABASE}
+    # For local development we mount the source for fast iteration.
+    # REMOVE or comment out the volume line in production builds (use the baked image instead).
     volumes:
       - ./:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
