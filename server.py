@@ -1,4 +1,3 @@
-# server.py — updated (keeps all original logic; adds safe column detection)
 import os
 import re
 import json
@@ -6,591 +5,136 @@ import traceback
 from html import escape
 from dotenv import load_dotenv
 from openai import OpenAI
-from flask import Flask, request, jsonify, send_from_directory, g
-import pyodbc  # ✅ changed from duckdb to pyodbc
+from flask import Flask, request, jsonify, send_from_directory, g, send_file
+import duckdb
 import pandas as pd
 import numpy as np
-import joblib
-from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
-import calendar
 import time
-from utils import rows_to_html_table, plot_to_base64, embed_text
+from utils import rows_to_html_table, plot_to_base64, embed_text  # your existing utils
 import uuid
 from pathlib import Path
-
-# NEW: sqlalchemy for pooling & safe per-request connections
-from sqlalchemy import create_engine, text
-
-# NEW: sqlite3 for memory DB
 import sqlite3
+import datetime as dtmod
+from io import BytesIO  # in-memory Excel export
 
-MEMORY_FILE = Path('./data/conversations.json')
-MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-print("PWD:", os.getcwd())
-
-# -------------------------
-# Relative time & phrase parsing helpers (unchanged logic)
-# -------------------------
-TZ = ZoneInfo("Asia/Kolkata")  # user timezone
-
-def _start_of_month(dt: datetime) -> date:
-    return date(dt.year, dt.month, 1)
-
-def _end_of_month(dt: datetime) -> date:
-    last_day = calendar.monthrange(dt.year, dt.month)[1]
-    return date(dt.year, dt.month, last_day)
-
-def month_n_ago(today_dt: datetime, n: int):
-    y = today_dt.year
-    m = today_dt.month - n
-    while m <= 0:
-        m += 12
-        y -= 1
-    return y, m
-def parse_relative_time_phrase(question: str):
-    q = (question or "").lower()
-    now = datetime.now(TZ)
-
-    # Be strict about "current time" detection so "installation time" or "average time" won't match.
-    # Match explicit clock/time-of-day requests only.
-    if re.search(r"\b(what(?:'s| is)? the time|what time is it|current time|time now|tell me the time|time\?)\b", q):
-        return {"type": "now", "datetime": now}
-    if re.search(r"\b(today|what(?:'s| is)? the date|current date|date today|todays date|what is the date today)\b", q):
-        return {"type": "day", "date": now.date().isoformat(), "datetime": now}
-
-    # days ago / yesterday
-    m = re.search(r'\b(\d+)\s+days?\s+ago\b', q)
-    if m:
-        n = int(m.group(1))
-        target = (now - timedelta(days=n)).date()
-        return {"type":"day", "date": target.isoformat()}
-    if re.search(r'\byesterday\b', q):
-        target = (now - timedelta(days=1)).date()
-        return {"type":"day", "date": target.isoformat()}
-
-    # months ago / last month / specific month
-    m = re.search(r'\b(\d+)\s+months?\s+ago\b', q)
-    if m:
-        n = int(m.group(1))
-        y, mth = month_n_ago(now, n)
-        return {"type":"month", "month": f"{y:04d}-{mth:02d}"}
-    if re.search(r'\b(previous|last)\s+month\b', q):
-        y, mth = month_n_ago(now, 1)
-        return {"type":"month", "month": f"{y:04d}-{mth:02d}"}
-    m = re.search(r'\b(\d+)(?:st|nd|rd|th)?\s+previous\s+month\b', q)
-    if m:
-        n = int(m.group(1))
-        y, mth = month_n_ago(now, n)
-        return {"type":"month", "month": f"{y:04d}-{mth:02d}"}
-    m = re.search(r'\b(\d+)(?:st|nd|rd|th)?\s+previous\b', q)
-    if m:
-        n = int(m.group(1))
-        y, mth = month_n_ago(now, n)
-        return {"type":"month", "month": f"{y:04d}-{mth:02d}"}
-    if re.search(r'\b(this|current)\s+month\b', q):
-        y, mth = month_n_ago(now, 0)
-        return {"type":"month", "month": f"{y:04d}-{mth:02d}"}
-    m = re.search(r'\blast\s+(\d+)\s+months\b', q)
-    if m:
-        n = int(m.group(1))
-        start_y, start_m = month_n_ago(now, n)
-        start = _start_of_month(datetime(start_y, start_m, 1))
-        end_y, end_m = month_n_ago(now, 1)
-        end = _end_of_month(datetime(end_y, end_m, 1))
-        return {"type":"range", "start": start.isoformat(), "end": end.isoformat()}
-    m = re.search(r'\bfor\s+([a-zA-Z]+)(?:\s+(\d{4}))?\b', q)
-    if m:
-        month_name = m.group(1)
-        year = m.group(2)
-        try:
-            month_num = list(calendar.month_name).index(month_name.capitalize())
-            if month_num == 0:
-                month_num = list(calendar.month_abbr).index(month_name.capitalize())
-            if month_num != 0:
-                y = int(year) if year else now.year
-                return {"type":"month", "month": f"{y:04d}-{month_num:02d}"}
-        except Exception:
-            pass
-    return None
-
-
-def get_existing_date_column():
-    """
-    Detect which date column actually exists in the SQL table.
-    Uses _columns_from_cursor() to avoid indexing the wrong field.
-    """
-    date_candidates = ['sale_date_parsed', 'SaleDate', 'OrderDate', 'Date']
-    existing_cols = _columns_from_cursor() or list(COLS)  # fallback to COLS if helper returns empty
-    # normalize names to exact-case from COLS if possible
-    existing_lower = {c.lower(): c for c in existing_cols}
-    for cand in date_candidates:
-        if cand.lower() in existing_lower:
-            return existing_lower[cand.lower()]
-    # fallback: first column that contains 'date' in name
-    for c in existing_cols:
-        if 'date' in c.lower():
-            return c
-    return existing_cols[0] if existing_cols else (DETECTED.get('date') or 'SaleDate')
-
-def handle_relative_time(question: str, sale_date_col="sale_date_parsed"):
-    parsed = parse_relative_time_phrase(question)
-    if not parsed:
-        return None
-    if parsed.get("type") == "now":
-        dt = parsed.get("datetime")
-        return {"action":"now", "text": dt.strftime("%Y-%m-%d %H:%M:%S %Z")}
-    if parsed.get("type") == "day":
-        d = parsed.get("date")
-        cond = f"TRY_CAST({sale_date_col} AS DATE) = '{d}'"
-        return {"action":"filter", "filter_sql": cond, "meta": parsed}
-    if parsed.get("type") == "month":
-        mon = parsed.get("month")
-        cond = f"FORMAT({sale_date_col}, 'yyyy-MM') = '{mon}'"
-        return {"action":"filter", "filter_sql": cond, "meta": parsed}
-    if parsed.get("type") == "range":
-        s = parsed.get("start")
-        e = parsed.get("end")
-        cond = f"TRY_CAST({sale_date_col} AS DATE) BETWEEN '{s}' AND '{e}'"
-        return {"action":"filter", "filter_sql": cond, "meta": parsed}
-    return None
-
-# -------------------------
-# Helper: ask_model_for_sql
-# -------------------------
-def ask_model_for_sql(question: str, schema_cols, sample_rows: pd.DataFrame):
-    """
-    Uses OpenAI to convert a natural-language question into a SQL Server SELECT query.
-    """
-    schema_text = ", ".join(schema_cols)
-    sample_text = sample_rows.head(5).to_csv(index=False) if not sample_rows.empty else "no sample rows"
-    system = (
-        "You are an expert SQL generator for Microsoft SQL Server. "
-        "The main table is named OrderItemUnit (or dataset_clean if present). "
-        "Return ONLY one SELECT query that answers the user's question. "
-        "If you cannot express it as SQL, return exactly NO_SQL. "
-        "Use standard SQL Server syntax — for example, use FORMAT(SaleDate, 'yyyy-MM') for months, "
-        "and TOP 10 instead of LIMIT 10."
-    )
-    user = f"Columns: {schema_text}\nSample (CSV):\n{sample_text}\n\nQuestion: {question}\n\nReturn only SQL or NO_SQL."
-
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        temperature=0.0,
-        max_tokens=512
-    )
-
-    return resp.choices[0].message.content.strip()
-
-# -------------------------
-# SQL safety / normalization + LLM helpers (needed by /chat)
-# -------------------------
-def is_safe_select(sql: str) -> bool:
-    """
-    Allow only SELECT/ WITH ... SELECT statements (no DDL/DML).
-    Strips ``` fences and trailing semicolons, then checks for forbidden keywords.
-    """
-    if not sql or not isinstance(sql, str):
-        return False
-    s = sql.strip()
-    s = re.sub(r"^```(?:sql)?\s*|\s*```$", "", s, flags=re.IGNORECASE).strip()
-    s = re.sub(r";\s*$", "", s)
-    # disallow multiple statements separated by semicolon
-    if ";" in s:
-        return False
-    s_low = s.lower()
-    # require SELECT or WITH
-    if not (s_low.startswith("select") or s_low.startswith("with")):
-        return False
-    forbidden = [
-        r"\binsert\b", r"\bupdate\b", r"\bdelete\b", r"\bdrop\b", r"\bcreate\b",
-        r"\balter\b", r"\battach\b", r"\bmerge\b", r"\bcopy\b", r"\bvacuum\b",
-        r"\bpragma\b", r"\bexport\b", r"\bimport\b", r"\bcall\b", r"\bexecute\b",
-        r"\bgrant\b", r"\brevoke\b"
-    ]
-    for kw in forbidden:
-        if re.search(kw, s_low):
-            return False
-    return True
-
-def normalize_sql_columns(sql: str) -> str:
-    """
-    Replace bare column tokens with exact-cased column names from COLS when possible.
-    This helps keep generated SQL compatible with your DB column names.
-    """
-    if not sql or not isinstance(sql, str):
-        return sql
-    col_map = {c.lower(): c for c in COLS}
-    def repl(m):
-        token = m.group(0)
-        return col_map.get(token.lower(), token)
-    # only replace identifiers (letters, underscores, digits) to avoid touching functions
-    return re.sub(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", repl, sql)
-
-def ask_model_fix_sql(bad_sql: str, error_msg: str, schema_cols, sample_rows: 'pd.DataFrame'):
-    """
-    Ask the LLM to fix a SQL error. Returns corrected SQL or NO_SQL.
-    """
-    schema_text = ", ".join(schema_cols)
-    sample_text = sample_rows.head(3).to_csv(index=False) if not sample_rows.empty else "no sample rows"
-    system = "You are a SQL fixer for Microsoft SQL Server. Given erroneous SQL and its error message, return a corrected single SELECT or NO_SQL."
-    user = f"Schema: {schema_text}\nSample:\n{sample_text}\nSQL:\n{bad_sql}\nError:\n{error_msg}\nReturn corrected SQL or NO_SQL."
-    try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.0,
-            max_tokens=512
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        # if the LLM call fails, fall back to no fix
-        print("ask_model_fix_sql failed:", e)
-        return None
-
-def ask_model_explain(question: str, sql: str, preview_df: 'pd.DataFrame'):
-    """
-    Ask the LLM to give a concise explanation of SQL results.
-    """
-    system = "You are a concise data analyst. Provide a one-line summary and 1-2 sentences of detail grounded in the result preview."
-    preview = preview_df.head(8).to_csv(index=False) if not preview_df.empty else "no rows"
-    user = f"Question: {question}\nSQL:\n{sql}\nResult preview:\n{preview}\nAnswer concisely."
-    try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.0,
-            max_tokens=256
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print("ask_model_explain failed:", e)
-        return "Here are the results."
-
-# (optional) nearest-neighbor helper if you later use embeddings
-def topk_similar(q_emb, k=6):
-    if nbrs is None:
-        return []
-    dists, idxs = nbrs.kneighbors([q_emb], n_neighbors=k, return_distance=True)
-    idxs = idxs[0]
-    out = []
-    for i in idxs:
-        out.append(meta[int(i)])
-    return out
-
-# -------------------------
-# Small helper: safe columns_from_cursor for pyodbc
-# -------------------------
-def _columns_from_cursor():
-    """
-    Return list of column names for TABLE using pyodbc cursor.columns(). 
-    Handles different pyodbc row shapes safely.
-    """
-    cols = []
-    try:
-        # use a fresh cursor for this call to avoid interfering with other cursors
-        c = get_cursor()
-        for r in c.columns(table=TABLE):
-            # prefer attribute, otherwise fallback to index 3
-            if hasattr(r, "column_name"):
-                cols.append(r.column_name)
-            else:
-                try:
-                    # many pyodbc implementations put column name at index 3
-                    cols.append(r[3])
-                except Exception:
-                    # ultimate fallback: try all fields and pick a string that looks like a column
-                    for fld in r:
-                        if isinstance(fld, str) and fld and fld.lower() not in (TABLE.lower(),):
-                            cols.append(fld)
-                            break
-        try:
-            c.close()
-        except Exception:
-            pass
-    except Exception:
-        # on any error, return empty list and caller will fallback to previously fetched COLS
-        return []
-    return cols
-
-def _get_existing_columns_set():
-    cols = _columns_from_cursor()
-    if cols:
-        return set(cols)
-    return set(COLS)
-
-# -------------------------
-# New helper: rewrite and run SQL (ensures date tokens converted)
-# -------------------------
-def _detect_date_col_once():
-    """Detect date column used for filters and months; store in global DATE_COL."""
-    global DATE_COL
-    try:
-        DATE_COL = get_existing_date_column()
-    except Exception:
-        # if get_existing_date_column not usable, fallback to first date-like in COLS
-        DATE_COL = next((c for c in COLS if 'date' in c.lower()), (COLS[0] if COLS else 'SaleDate'))
-    return DATE_COL
-
-def rewrite_date_tokens_for_sqlserver(sql_text: str, date_col: str = None) -> str:
-    """
-    - Replace bare sale_date_parsed tokens with actual date column.
-    - Convert DuckDB STRFTIME(sale_date_parsed, '%Y-%m') -> FORMAT(<date_col>, 'yyyy-MM')
-    - Also handle STRFTIME(SaleDate, '%Y-%m') -> FORMAT(SaleDate, 'yyyy-MM') and similar.
-    """
-    if not sql_text or not isinstance(sql_text, str):
-        return sql_text
-    s = sql_text
-
-    # choose date column
-    if date_col is None:
-        date_col = globals().get('DATE_COL') or _detect_date_col_once()
-
-    # 1) replace STRFTIME(sale_date_parsed, '%Y-%m') and variants -> FORMAT(date_col, 'yyyy-MM')
-    s = re.sub(
-        r"STRFTIME\(\s*sale_date_parsed\s*,\s*['\"]%Y-%m['\"]\s*\)",
-        f"FORMAT({date_col}, 'yyyy-MM')",
-        s, flags=re.IGNORECASE
-    )
-    # generic STRFTIME(sale_date_parsed, '...') fallback -> FORMAT(date_col, 'yyyy-MM')
-    s = re.sub(
-        r"STRFTIME\(\s*sale_date_parsed\s*,\s*['\"].+?['\"]\s*\)",
-        f"FORMAT({date_col}, 'yyyy-MM')",
-        s, flags=re.IGNORECASE
-    )
-
-    # 2) replace STRFTIME(SaleDate, '%Y-%m') -> FORMAT(SaleDate, 'yyyy-MM')
-    s = re.sub(
-        r"STRFTIME\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*['\"]%Y-%m['\"]\s*\)",
-        lambda m: f"FORMAT({m.group(1)}, 'yyyy-MM')",
-        s, flags=re.IGNORECASE
-    )
-
-    # 3) Replace bare sale_date_parsed token (case-insensitive) with date_col
-    s = re.sub(r"\bsale_date_parsed\b", date_col, s, flags=re.IGNORECASE)
-
-    # 4) Replace CamelCase variants like SaleDate_parsed etc.
-    s = re.sub(r"\bsale_date_parsed\b", date_col, s, flags=re.IGNORECASE)
-
-    # 5) If code erroneously used STRFTIME(..., '%Y-%m') with other tokens, leave as-is or convert above
-    return s
-
-def run_sql_and_fetch_df(sql: str, con_obj=None):
-    """
-    Centralized helper to rewrite sql, print it, and execute with pandas.
-    Returns DataFrame or raises the same exceptions pandas would.
-    """
-    if con_obj is None:
-        con_obj = con
-
-    # apply date-token rewrites first (duckdb -> SQL Server, etc.)
-    sql_rewritten = rewrite_date_tokens_for_sqlserver(sql)
-
-    # Make CAST conversions safe: convert CAST(... AS ...) -> TRY_CAST(... AS ...)
-    # This prevents SQL Server from throwing when strings are non-numeric.
-    try:
-        sql_rewritten = re.sub(r'\bCAST\s*\(', 'TRY_CAST(', sql_rewritten, flags=re.IGNORECASE)
-    except Exception:
-        # if regex fails for any reason, continue with original SQL
-        pass
-
-    # debug print so you can copy exact SQL that was executed
-    print("Executing SQL →\n", sql_rewritten)
-
-    # use pandas to fetch (consistent with previous code)
-    # Note: pandas accepts SQLAlchemy engine or raw DBAPI connection. We keep using the engine (con) when possible.
-    return pd.read_sql(sql_rewritten, con_obj)
-
-def run_sql_no_return(sql: str, con_obj=None):
-    """
-    Execute a SQL that doesn't return a dataframe (e.g., DDL) via cursor after rewrite.
-    """
-    if con_obj is None:
-        con_obj = con
-
-    sql_rewritten = rewrite_date_tokens_for_sqlserver(sql)
-
-    # Make CAST conversions safe for non-returning SQL too
-    try:
-        sql_rewritten = re.sub(r'\bCAST\s*\(', 'TRY_CAST(', sql_rewritten, flags=re.IGNORECASE)
-    except Exception:
-        pass
-
-    print("Executing SQL (no-return) →\n", sql_rewritten)
-    # Use a raw cursor for non-returning calls
-    cur = get_cursor()
-    try:
-        res = cur.execute(sql_rewritten)
-        # commit if possible (if con_obj is a DBAPI connection)
-        try:
-            # if we got a DBAPI connection from engine.raw_connection(), commit on that
-            raw_conn = cur.connection
-            raw_conn.commit()
-        except Exception:
-            pass
-        return res
-    finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-
-
-# -------------------------
-# Load environment, DB, OpenAI client
-# -------------------------
+# CONFIG / ENV
+# -------------------------------------------------
 load_dotenv()
 
+DEBUG_SQL = os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
+
+TZ = ZoneInfo("Asia/Kolkata")  # user timezone
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DUCKDB_FILE = os.getenv("DUCKDB_FILE", "./data/sales.duckdb")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "3000"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "5000"))
+QUERY_CACHE = {}      # { sql_text: { "response": result_dict, "time": timestamp } }
+CACHE_TTL = 30        # cache lifespan in seconds (you can increase to 60 if needed)
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY must be set in environment")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------------
-# Connect to SQL Server (replaces DuckDB)
-# -------------------------
-print("Connecting to SQL Server...")
+# directory for Excel exports (kept, but no longer used for auto-writing per-query)
+EXPORT_DIR = Path("./data/exports")
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Build SQLAlchemy engine URL (keeps your credentials and driver — adjust if necessary)
-# Note: credentials are used inline here (same as your previous code). If you later prefer env vars, swap them.
-# prefer environment variables (set locally in .env or in Render UI)
-username = os.getenv("SQL_USER") or os.getenv("SQL_USERNAME") or "devswetha"
-password = os.getenv("SQL_PASSWORD") or os.getenv("SQL_PASS") or "xwnpZgdX"
-host     = os.getenv("SQL_SERVER") or os.getenv("SQL_HOST") or "cableportalstage.westus2.cloudapp.azure.com"
-database = os.getenv("SQL_DATABASE") or os.getenv("SQL_DB") or "bundle_root"
-# driver string must be URL-encoded for spaces; sqlalchemy handles it via + for spaces
-conn_url = (
-    f"mssql+pyodbc://{username}:{password}@{host}/{database}"
-    "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes&MARS_Connection=Yes"
-)
+# In-memory cache for exports: token -> DataFrame or dict of DataFrames
+EXPORT_CACHE = {}
 
-try:
-    # create engine with pooling to avoid "connection is busy" contention
-    engine = create_engine(
-        conn_url,
-        pool_size=5,
-        max_overflow=5,
-        pool_pre_ping=True,
-        connect_args={"timeout": 15}
-    )
-    # Expose `con` as the SQLAlchemy engine so pandas.read_sql(..., con) works as before
-    con = engine
-    print("✅ SQLAlchemy engine created (connection pooling enabled).")
-except Exception as e:
-    # Fallback: attempt a direct pyodbc connection (keeps compatibility)
-    # but still set `con` to that connection (less ideal for concurrency)
-    try:
-        fallback_conn_str = (
-            "DRIVER={ODBC Driver 18 for SQL Server};"
-            f"SERVER={host};"
-            f"DATABASE={database};"
-            f"UID={username};"
-            f"PWD={password};"
-            "TrustServerCertificate=yes;MARS_Connection=Yes;"
-        )
-        py_conn = pyodbc.connect(fallback_conn_str)
-        con = py_conn
-        engine = None
-        print("⚠️ SQLAlchemy engine creation failed — using raw pyodbc connection as fallback.", e)
-    except Exception as e2:
-        raise RuntimeError(f"❌ Failed to connect to SQL Server: {e} ; fallback also failed: {e2}")
+# -------------------------------------------------
+# SAMPLE CHAT (QUESTIONS ONLY; ALWAYS RUNS ON LATEST DATA)
+# -------------------------------------------------
+SAMPLE_CHAT_ID = "sample-chat"
+SAMPLE_CHAT_TITLE = "Sample Questions"
+SAMPLE_CHAT_CREATED_AT = 1700000000000  # stable timestamp (ms)
 
-# Helper functions to get raw DBAPI connections/cursors when code expects cursor()
-def get_dbapi_conn():
+SAMPLE_MESSAGES = [
+    {
+        "role": "bot",
+        "text": "Here are sample questions you can run. Click a sample question and press “Run this question” to get the latest answer.",
+        "table_html": "",
+        "plot_data_uri": None,
+        "download_url": None,
+        "time": SAMPLE_CHAT_CREATED_AT,
+    },
+    {"role": "user", "text": "show me the column names", "time": SAMPLE_CHAT_CREATED_AT + 1},
+    {"role": "user", "text": "give me any 5 account number from august 2025", "time": SAMPLE_CHAT_CREATED_AT + 2},
+    {"role": "user", "text": "give details of the account #554517388438", "time": SAMPLE_CHAT_CREATED_AT + 3},
+    {
+        "role": "user",
+        "text": "show me the total order,installation order,installation rate,profit,disconnection rate month wise where provider is spectrum for 2024",
+        "time": SAMPLE_CHAT_CREATED_AT + 4,
+    },
+    {
+        "role": "user",
+        "text": "show me the total installation order where installed order =1 based on provider for 2025",
+        "time": SAMPLE_CHAT_CREATED_AT + 5,
+    },
+    {"role": "user", "text": "give me the account number which had different customer names limit 10", "time": SAMPLE_CHAT_CREATED_AT + 6},
+    {"role": "user", "text": "show me the unique product names", "time": SAMPLE_CHAT_CREATED_AT + 7},
+    {"role": "user", "text": "give top 10 product name, their profit , profit rate based on profit rate for 2024", "time": SAMPLE_CHAT_CREATED_AT + 8},
+    {"role": "user", "text": "show me the cancellation count for provider spectrum where status = cancelled for august 2025", "time": SAMPLE_CHAT_CREATED_AT + 9},
+    {"role": "user", "text": "show me the distinct status values", "time": SAMPLE_CHAT_CREATED_AT + 10},
+]
+
+SAMPLE_CHAT = {
+    "id": SAMPLE_CHAT_ID,
+    "title": SAMPLE_CHAT_TITLE,
+    "created_at": SAMPLE_CHAT_CREATED_AT,
+    "messages": SAMPLE_MESSAGES,
+}
+
+# DUCKDB CONNECTION
+# -------------------------------------------------
+db_path = DUCKDB_FILE.strip()
+if not (db_path.lower().startswith("md:") or db_path.lower().startswith("md://")):
+    db_path = os.path.abspath(db_path)
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"DuckDB file not found: {db_path}")
+
+def _get_duck_con():
     """
-    Return a raw DBAPI connection (pyodbc connection) from engine.raw_connection()
-    If engine is not available, return the existing pyodbc connection `con`.
-    Caller MUST close the returned connection when done.
+    Per-request connection for concurrency safety.
+    IMPORTANT: Must match the same config everywhere to avoid:
+      "Can't open a connection to same database file with a different configuration"
     """
-    if 'engine' in globals() and engine is not None:
-        raw_conn = engine.raw_connection()
-        return raw_conn
-    # fallback: `con` might itself be a DBAPI pyodbc connection
+    local_con = duckdb.connect(db_path, read_only=True)
+    local_con.execute("PRAGMA enable_progress_bar=false;")
+    local_con.execute("PRAGMA threads=4;")
+    return local_con
+
+# Detect tables / schema info (one-time metadata load using SAME config: read_only=True)
+with duckdb.connect(db_path, read_only=True) as _meta_con:
+    available_tables = [t[0] for t in _meta_con.execute("SHOW TABLES").fetchall()]
+    print("Detected tables:", available_tables)
+
+    TABLE = "aiv_OrderItemUnit_md"
+    if TABLE not in available_tables:
+        for t in available_tables:
+            if t.lower() == TABLE.lower():
+                TABLE = t
+                break
+
+    # Basic schema info
+    cols_info = _meta_con.execute(f"PRAGMA table_info('{TABLE}')").fetchall()
+    COLS = [c[1] for c in cols_info] if cols_info else []
+
+    # Sample and row count
+    SAMPLE_DF = _meta_con.execute(f"SELECT * FROM {TABLE} LIMIT 10").fetchdf() if COLS else pd.DataFrame()
     try:
-        return con
+        ROWCOUNT = _meta_con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
     except Exception:
-        raise RuntimeError("No DBAPI connection available")
+        ROWCOUNT = None
 
-def get_cursor():
-    """
-    Return a DBAPI cursor. Caller should close cursor (and connection if created here) when done.
-    We return a cursor object; if it came from a raw connection created here, caller should close the connection via cursor.connection.close()
-    """
-    raw_conn = get_dbapi_conn()
-    # if raw_conn is a SQLAlchemy Engine (shouldn't be), raise — but we avoid that above
-    cur = raw_conn.cursor()
-    return cur
+print(f"Using table: {TABLE} rows={ROWCOUNT}, cols={len(COLS)}")
 
-TABLE = "OrderItemUnit"  # use your clean table/view or actual table name
-
-# fetch column names dynamically (use cursor.description fallback)
-cursor = None
-try:
-    # use a raw cursor to fetch a single row's description (works with DBAPI cursor)
-    cur = get_cursor()
-    cur.execute(f"SELECT TOP 1 * FROM {TABLE}")
-    # some cursors populate .description; handle robustly
-    try:
-        COLS = [column[0] for column in cur.description]
-    except Exception:
-        # fallback to pandas if description missing
-        try:
-            SAMPLE_DF = pd.read_sql(f"SELECT TOP 10 * FROM {TABLE}", con)
-            COLS = list(SAMPLE_DF.columns)
-        except Exception:
-            COLS = []
-    try:
-        cur.close()
-    except Exception:
-        pass
-except Exception:
-    # fallback: try a pandas read
-    try:
-        SAMPLE_DF = pd.read_sql(f"SELECT TOP 10 * FROM {TABLE}", con)
-        COLS = list(SAMPLE_DF.columns)
-    except Exception:
-        COLS = []
-
-# try to get a sample df for LLM prompts
-try:
-    SAMPLE_DF = pd.read_sql(f"SELECT TOP 10 * FROM {TABLE}", con)
-except Exception:
-    SAMPLE_DF = pd.DataFrame()
-
-try:
-    # use raw cursor for count to avoid pandas overhead here
-    cur = get_cursor()
-    cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
-    try:
-        total_count = cur.fetchone()[0]
-    except Exception:
-        total_count = None
-    try:
-        cur.close()
-    except Exception:
-        pass
-except Exception:
-    total_count = None
-
-# debug prints to verify columns (remove if noisy)
-print(f"Using table: {TABLE} rows={total_count}, cols={len(COLS)}")
-print("Columns detected (COLS variable):", COLS)
-# safe call to _columns_from_cursor() will use get_cursor internally
-print("Columns from cursor.columns():", _columns_from_cursor())
-
-# detect date column once
-DATE_COL = _detect_date_col_once()
-print("Using date column for filters:", DATE_COL)
-
+# HELPER: column detection (revenue/profit/date)
+# -------------------------------------------------
 def find_best(cols, candidates):
     cols_lower = {c.lower(): c for c in cols}
     for cand in candidates:
@@ -598,27 +142,591 @@ def find_best(cols, candidates):
             return cols_lower[cand.lower()]
     return None
 
-REVENUE_CANDS = ['Revenue','ProviderPaid','NetAfterCb','GrossAfterCb','Amount','SaleAmount']
-PROFIT_CANDS = ['Profit','NetProfit','ProfitAmount','Margin']
-DATE_CANDS = ['sale_date_parsed','SaleDate','Date','OrderDate']
-CHANNEL_CANDS = ['MainChannel','SalesChannel','Channel','ChannelName']
+# Candidate lists
+REVENUE_CANDS = [
+    'NetAfterChargeback', 'NetAfterCb', 'GrossAfterCb',
+    'Revenue', 'ProviderPaid', 'Amount', 'SaleAmount'
+]
+PROFIT_CANDS = ['Profit', 'NetProfit', 'ProfitAmount', 'Margin']
+DATE_CANDS = ['sale_date_parsed', 'SaleDate', 'Date', 'OrderDate']
+
+def qident(name: str) -> str:
+    """Properly quote an identifier for DuckDB (safe, avoids f-string backslash parsing)."""
+    return '"' + name.replace('"', '""') + '"'
 
 DETECTED = {
     'date': find_best(COLS, DATE_CANDS),
     'revenue': find_best(COLS, REVENUE_CANDS),
     'profit': find_best(COLS, PROFIT_CANDS),
-    'channel': find_best(COLS, CHANNEL_CANDS)
 }
+
 print("Auto-detected columns:", DETECTED)
 
-# -------------------------
-# Flask app
-# -------------------------
+def get_revenue_col():
+    r = DETECTED.get('revenue')
+    if r and r in COLS:
+        return r
+    for cand in REVENUE_CANDS:
+        if cand in COLS:
+            return cand
+    return None
+
+def get_profit_col():
+    p = DETECTED.get('profit')
+    if p and p in COLS:
+        return p
+    for cand in PROFIT_CANDS:
+        if cand in COLS:
+            return cand
+    return None
+
+def get_date_col():
+    d = DETECTED.get('date')
+    if d and d in COLS:
+        return d
+    for c in DATE_CANDS:
+        if c in COLS:
+            return c
+    return COLS[0] if COLS else None
+
+# handy flags for customer name logic
+HAS_CUST_FIRST = any(c.lower() == "customerfirstname" for c in COLS)
+HAS_CUST_LAST = any(c.lower() == "customerlastname" for c in COLS)
+CUST_FIRST_COL = next((c for c in COLS if c.lower() == "customerfirstname"), None)
+CUST_LAST_COL = next((c for c in COLS if c.lower() == "customerlastname"), None)
+
+def run_sql_and_fetch_df(sql: str, print_errors: bool = True):
+    """Execute SQL and return a pandas DataFrame."""
+    if DEBUG_SQL:
+        print("DEBUG SQL:\n", sql)
+    try:
+        with _get_duck_con() as local_con:
+            df = local_con.execute(sql).fetchdf()
+        return df
+    except Exception as e:
+        if print_errors:
+            print("SQL execution error:", e, traceback.format_exc())
+        raise
+
+def _safe_user_error(msg=None):
+    return {
+        "reply": msg or "Sorry — I couldn't get that data. Please try rephrasing or ask fewer filters.",
+        "table_html": "",
+        "plot_data_uri": None,
+    }
+
+def _log_and_mask_error(e, context=""):
+    print("INTERNAL ERROR:", context, str(e), traceback.format_exc())
+    return "I couldn't complete that query due to an internal error. Try rephrasing or ask a simpler question."
+
+def is_safe_select(sql: str) -> bool:
+    """Check if SQL is a safe SELECT query (no DML/DDL)."""
+    sql_clean = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
+    sql_clean = re.sub(r"/\*.*?\*/", "", sql_clean, flags=re.DOTALL).strip()
+    if not sql_clean:
+        return False
+    first_word = sql_clean.split()[0].upper()
+    if first_word != "SELECT":
+        return False
+    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE"]
+    for w in forbidden:
+        if re.search(rf"\b{w}\b", sql_clean, flags=re.IGNORECASE):
+            return False
+    return True
+
+# -------------------------------------------------
+# Make formulas readable (avoid LaTeX)
+# -------------------------------------------------
+def strip_latex_math(text: str) -> str:
+    """
+    Convert common LaTeX math wrappers to plain text so frontend can read it.
+    Not a full LaTeX parser — just enough for \[ \], \( \), and simple \text{}.
+    """
+    if not text:
+        return text
+
+    t = text
+    t = re.sub(r"\\\[\s*", "", t)
+    t = re.sub(r"\s*\\\]", "", t)
+    t = re.sub(r"\\\(\s*", "", t)
+    t = re.sub(r"\s*\\\)", "", t)
+    t = re.sub(r"\\text\{([^}]*)\}", r"\1", t)
+    t = t.replace("\\%", "%").replace("\\_", "_")
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+def classify_intent(question: str) -> str:
+    q = (question or "").strip().lower()
+    if not q:
+        return "empty"
+
+    # normalize: remove punctuation so "hi!" works
+    q_clean = re.sub(r'[^a-z\s]', ' ', q)
+    q_clean = re.sub(r'\s+', ' ', q_clean).strip()
+
+    # greetings / smalltalk
+    greetings = {
+        "hi", "hello", "hey", "yo", "hola", "sup",
+        "good morning", "good afternoon", "good evening"
+    }
+    if q_clean in greetings:
+        return "smalltalk"
+    if q_clean.startswith(("hi ", "hello ", "hey ")):
+        return "smalltalk"
+    if "your name" in q_clean or "who are you" in q_clean:
+        return "smalltalk"
+
+    # schema / metadata
+    if "what columns" in q_clean or "what fields" in q_clean or "show schema" in q_clean:
+        return "meta"
+    if re.search(r'\b(show|list|display|give|what are)\b.*\b(column names?|columns|fields|attributes|headings)\b', q_clean):
+        return "meta"
+
+    # everything else: treat as data question
+    return "data_question"
+
+
+# LLM HELPERS
+# -------------------------------------------------
+def ask_model_for_sql(question: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
+    """
+    Ask the LLM to decide:
+    - if the question is about the dataset → return one DuckDB SELECT.
+    - if not → return NO_SQL.
+    """
+    try:
+        schema_info = f"Columns: {', '.join(schema_cols)}"
+        sample_info = sample_rows.head(10).to_csv(index=False) if not sample_rows.empty else "No sample data"
+
+        date_col = get_date_col()
+        rev_col = get_revenue_col()
+        profit_col = get_profit_col()
+
+        # extra semantic hints
+        semantic_lines = []
+        if CUST_FIRST_COL and CUST_LAST_COL:
+            semantic_lines.append(
+                f"- CustomerFirstName + CustomerLastName together form the full customer name.\n"
+                f"  When the user says 'customer name' or 'customer names' or 'customer' , use "
+                f"TRIM({CUST_FIRST_COL}) || ' ' || TRIM({CUST_LAST_COL}) as CustomerName and "
+                f"exclude rows where both are NULL or empty."
+            )
+            semantic_lines.append(
+                f"- If the user asks whether the same account number has different customer names, "
+                f"group by Account (or Account-like column) and use "
+                f"HAVING COUNT(DISTINCT TRIM({CUST_FIRST_COL}) || ' ' || TRIM({CUST_LAST_COL})) > 1."
+            )
+        semantic_lines.append(
+            "- If the user asks for 'any N X' or 'sample N X values', use SELECT DISTINCT on that "
+            "column or expression, filter out NULL/empty values, and LIMIT N."
+        )
+        extra_semantics = "\n".join(semantic_lines)
+
+        # IMPORTANT: rf""" ... """ avoids Python invalid-escape warnings like \[
+        prompt = rf"""
+You are an assistant that generates DuckDB SQL for a single table called {TABLE}.
+
+Your job:
+1. Decide if the user's question is about this table's data.
+2. If YES → return exactly ONE DuckDB SELECT statement that answers it.
+3. If NO → return exactly NO_SQL.
+
+DO NOT return explanations, markdown, or comments.
+Return ONLY:
+- a single SELECT ... FROM {TABLE} ... statement, OR
+- the token NO_SQL.
+
+Table name: {TABLE}
+Usable columns (ONLY these): {', '.join(schema_cols)}
+
+Business meaning hints (if these columns exist):
+- Date column: {date_col}
+- Revenue column (money received): {rev_col}
+- Profit column (net profit): {profit_col}
+
+Additional semantic hints:
+{extra_semantics or '- (none)'}
+
+Technical rules:
+- When you work with dates, ALWAYS cast the date column to DATE first:
+  CAST({date_col} AS DATE)
+  (Assume {date_col} is stored as text and must be cast.)
+- For year-month buckets:
+  STRFTIME('%Y-%m', CAST({date_col} AS DATE))
+- For year-only buckets:
+  STRFTIME('%Y', CAST({date_col} AS DATE))
+- When filtering on dates (last month, a specific month/year, etc.), always compare using CAST({date_col} AS DATE), e.g.:
+  WHERE CAST({date_col} AS DATE) >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND CAST({date_col} AS DATE) <  DATE_TRUNC('month', CURRENT_DATE)
+  or for October 2025:
+  WHERE CAST({date_col} AS DATE) >= DATE '2025-10-01'
+    AND CAST({date_col} AS DATE) <  DATE '2025-11-01'
+- Do NOT invent aliases like date_col_expr unless you define them in the SELECT/FROM.
+  If you want to reuse the expression, just repeat CAST({date_col} AS DATE) wherever needed.
+- For case-insensitive text comparison:
+  LOWER(TRIM(CAST(col AS VARCHAR))) = LOWER(TRIM('value'))
+- When returning names or values for a column, prefer to exclude NULL or empty strings:
+  WHERE col IS NOT NULL AND TRIM(COALESCE(CAST(col AS VARCHAR),'')) <> ''
+- When the user asks for results "based on", "by", "where", "sorted by" or "whose <metric> ..."
+  (e.g. "based on profit", "by profit", "estimated commission = 250", "orders > 150"):
+  ALWAYS include both:
+  • the identifying column(s) (e.g. ProviderName, MainChannel, Package), AND
+  • the metric column(s) you are using (Profit, Revenue, EstimatedCommission, COUNT(*) AS orders, etc.)
+  in the SELECT list.
+
+- If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
+- If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
+
+Schema:
+{schema_info}
+
+Tiny sample (only for understanding meaning, not for answering):
+{sample_info}
+
+User question:
+{question}
+
+Now output either:
+- ONE DuckDB SELECT query (no backticks, no explanation), OR
+- NO_SQL
+"""
+
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=600,
+        )
+
+        sql = (response.choices[0].message.content or "").strip()
+
+        # Strip code fences if model added them
+        sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql, flags=re.IGNORECASE).strip()
+
+        if sql.upper() == "NO_SQL":
+            return "NO_SQL"
+
+        if not is_safe_select(sql):
+            return "NO_SQL"
+
+        return sql
+
+    except Exception as e:
+        print(f"Error generating SQL: {e}", traceback.format_exc())
+        return "NO_SQL"
+
+def ask_model_fix_sql(bad_sql: str, error: str, schema_cols: list, sample_rows: pd.DataFrame) -> str:
+    """Ask LLM to fix problematic SQL."""
+    try:
+        date_col = get_date_col()
+
+        if date_col:
+            date_fix_rules = f"""
+- If you compare the date column {date_col} to CURRENT_DATE or use DATE_TRUNC,
+  ALWAYS wrap it as TRY_CAST({date_col} AS DATE).
+  Example:
+    WHERE TRY_CAST({date_col} AS DATE) >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+"""
+        else:
+            date_fix_rules = """
+- Do NOT introduce date filters unless the user explicitly requires them and a real date
+  column name from the schema is used.
+"""
+
+        prompt = rf"""
+The following DuckDB SQL query failed with error: {error}
+
+Broken SQL:
+{bad_sql}
+
+The table name is {TABLE}.
+Usable columns: {', '.join(schema_cols)}
+
+Fix the SQL so it works in DuckDB, while respecting these rules:
+- Only a single SELECT statement.
+- No INSERT/UPDATE/DELETE/DDL.
+- Use only the listed columns.
+- NEVER invent or use fake column names like "date_col_expr".
+- Do not change the user's intent.
+
+Additional rules for dates:
+{date_fix_rules}
+
+If you need to compare a date-like column (e.g. the main date column), you must:
+- Wrap it with TRY_CAST(column AS DATE) before comparing to CURRENT_DATE or using DATE_TRUNC.
+
+Return ONLY the fixed SQL or NO_SQL. No explanations, no markdown.
+"""
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=600,
+        )
+
+        fixed_sql = (response.choices[0].message.content or "").strip()
+        fixed_sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", fixed_sql, flags=re.IGNORECASE).strip()
+
+        if fixed_sql.upper() == "NO_SQL":
+            return "NO_SQL"
+        if not is_safe_select(fixed_sql):
+            return "NO_SQL"
+        return fixed_sql
+
+    except Exception as e:
+        print(f"Error fixing SQL: {e}", traceback.format_exc())
+        return "NO_SQL"
+
+def answer_theory_question(question: str):
+    """For general / non-data questions, or when no safe SQL is generated."""
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a clear, concise assistant.\n"
+                        "IMPORTANT: Do NOT use LaTeX (no \\[ \\], no \\( \\)).\n"
+                        "If you need formulas, write them in plain text, like:\n"
+                        "Profit = Total Revenue - Total Costs\n"
+                        "Profit Rate (%) = (Profit / Total Revenue) * 100\n"
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+            temperature=0.5,
+            max_tokens=800,
+        )
+        ans = (resp.choices[0].message.content or "").strip()
+        ans = strip_latex_math(ans)
+        return {
+            "reply": ans,
+            "table_html": "",
+            "plot_data_uri": None,
+        }
+    except Exception as e:
+        _log_and_mask_error(e, "answer_theory_question")
+        return _safe_user_error("I couldn't answer that right now. Please try again.")
+
+def handle_general_data_question(question: str, history=None):
+    """
+    Single generic data handler:
+    - Ask LLM for SQL or NO_SQL.
+    - If SQL → run it and summarize.
+    - If NO_SQL → answer purely in text.
+    """
+    schema_cols = COLS
+    qlow = (question or "").lower()
+
+    # --- conversation-aware context ---
+    history = history or []
+    if history:
+        ctx_lines = []
+        # keep last 6 messages to stay small
+        for m in history[-6:]:
+            role = m.get("role", "").upper()
+            content = (m.get("content") or "").strip()
+            if content:
+                ctx_lines.append(f"{role}: {content}")
+        context_block = "\n".join(ctx_lines)
+        augmented_question = (
+            "Conversation so far:\n"
+            f"{context_block}\n\n"
+            f"User's latest message:\nUSER: {question}\n"
+        )
+    else:
+        augmented_question = question
+    # -----------------------------------
+
+    # --- handle ambiguous time phrases like "last year", "this month" or month without year ---
+    has_year = bool(re.search(r'\b20\d{2}\b', qlow))
+
+    month_name = re.search(
+        r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b',
+        qlow
+    )
+
+    rel_time = re.search(
+        r'\b(last year|this year|next year|last month|this month|next month)\b',
+        qlow
+    )
+
+    # If user used relative time ("last year", "this month") OR mentioned a month with no year, ask for clarification
+    if rel_time or (month_name and not has_year):
+        msg = (
+            "To answer this accurately I need a specific year or month-year. "
+            "For example, try: 'in 2025' or 'in October 2025'."
+        )
+        return {
+            "reply": msg,
+            "table_html": "",
+            "plot_data_uri": None,
+        }
+    # --- END ambiguous time block ---
+
+    try:
+        with _get_duck_con() as local_con:
+            sample_rows = local_con.execute(f"SELECT * FROM {TABLE} LIMIT 50").fetchdf()
+    except Exception:
+        sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
+
+    # 1) Ask model for SQL  (conversation-aware)
+    sql_text = ask_model_for_sql(augmented_question, schema_cols, sample_rows)
+
+    # 2) If NO_SQL → theory/general mode (conversation-aware)
+    if not sql_text or sql_text.strip().upper() == "NO_SQL":
+        return answer_theory_question(augmented_question)
+    cache_key = sql_text.strip()
+    cached = QUERY_CACHE.get(cache_key)
+    if cached:
+        if (time.time() - cached["time"]) < CACHE_TTL:
+            # return cached result immediately
+            return cached["response"]
+
+    # 3) Normalize & re-check
+    sql_text = sql_text.strip()
+    if not is_safe_select(sql_text):
+        return _safe_user_error("Generated SQL was blocked for safety. Please rephrase your question.")
+
+    # 4) Execute with at most one auto-fix attempt
+    try_count = 0
+    last_error = None
+    df = None
+
+    while try_count < 2:
+        try:
+            df = run_sql_and_fetch_df(sql_text, print_errors=(try_count > 0))
+            break
+        except Exception as e:
+            last_error = str(e)
+            if try_count == 0:
+                fixed = ask_model_fix_sql(sql_text, last_error, schema_cols, sample_rows)
+                if fixed and fixed.strip().upper() != "NO_SQL":
+                    sql_text = fixed.strip()
+                    try_count += 1
+                    continue
+            _log_and_mask_error(last_error, "sql_execution")
+            return _safe_user_error("I couldn't execute the query I generated. Please try asking in a simpler way.")
+
+    if df is None:
+        return _safe_user_error("No data returned for that query.")
+
+    # 4.a) If the question talks about customer name(s), drop rows where both first & last are null/empty
+    qlow = (question or "").lower()
+    if re.search(r'\bcustomer\s+names?\b', qlow) and CUST_FIRST_COL and CUST_LAST_COL:
+        try:
+            fn = CUST_FIRST_COL
+            ln = CUST_LAST_COL
+            if fn in df.columns and ln in df.columns:
+                fn_series = df[fn].astype(str).str.strip()
+                ln_series = df[ln].astype(str).str.strip()
+                mask = ~((fn_series.eq("") | fn_series.eq("nan")) &
+                         (ln_series.eq("") | ln_series.eq("nan")))
+                df = df[mask]
+        except Exception as e:
+            print("Post-filter customer names error:", e)
+
+    total_rows = len(df)
+    truncated = False
+    df_preview = df
+
+    if MAX_ROWS and total_rows > MAX_ROWS:
+        truncated = True
+        df_preview = df.head(MAX_ROWS)
+
+    if not df_preview.empty:
+        table_html = rows_to_html_table(df_preview.to_dict(orient="records"))
+    else:
+        table_html = "<p><i>No data</i></p>"
+
+    # 5) Optional plot
+    plot_uri = None
+    try:
+        if not df.empty:
+            if "month" in df.columns:
+                nums = [c for c in df.columns if c != "month" and pd.api.types.is_numeric_dtype(df[c])]
+                if nums:
+                    ycol = nums[0]
+                    plot_uri = plot_to_base64(
+                        df["month"].astype(str).tolist(),
+                        df[ycol].fillna(0).tolist(),
+                        kind="line",
+                        title=question,
+                    )
+            else:
+                if df.shape[1] >= 2 and pd.api.types.is_numeric_dtype(df.iloc[:, 1]):
+                    labels = df.iloc[:, 0].astype(str).tolist()
+                    vals = df.iloc[:, 1].astype(float).fillna(0).tolist()
+                    plot_uri = plot_to_base64(labels, vals, kind="bar", title=question)
+    except Exception as e:
+        print("Plot error:", e, traceback.format_exc())
+        plot_uri = None
+
+    # 5.a) Prepare Excel export ONLY as in-memory cache; no file written to disk
+    download_url = None
+    try:
+        file_id = uuid.uuid4().hex
+        EXPORT_CACHE[file_id] = df_preview
+        download_url = f"/download/{file_id}"
+    except Exception as e:
+        print("Export cache error:", e, traceback.format_exc())
+        download_url = None
+
+    # 6) Let LLM summarize results
+    explanation = ""
+    if not df_preview.empty:
+        preview_rows = df_preview.head(50).to_dict(orient="records")
+        try:
+            prompt = (
+                f"User question: {question}\n"
+                f"SQL used:\n{sql_text}\n\n"
+                f"Result preview (first {min(50, len(preview_rows))} rows, JSON):\n"
+                f"{json.dumps(preview_rows, ensure_ascii=False)}\n\n"
+                f"Please provide:\n"
+                f"1. One short headline-style summary line.\n"
+                f"2. One or two sentences explaining the key points in plain language.\n\n"
+                f"IMPORTANT: Do NOT use LaTeX. If you include formulas, write them in plain text."
+            )
+            resp = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a concise data analyst. Avoid LaTeX; use plain text formulas."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=256,
+            )
+            explanation = (resp.choices[0].message.content or "").strip()
+            explanation = strip_latex_math(explanation)
+        except Exception:
+            explanation = f"Here are the results for: {question}"
+    else:
+        explanation = "No data found for that query."
+
+    result = {
+        "reply": explanation,
+        "table_html": table_html,
+        "plot_data_uri": plot_uri,
+        "rows_returned": total_rows,
+        "truncated": truncated,
+        "download_url": download_url,
+    }
+    if DEBUG_SQL:
+        result["debug_sql"] = sql_text
+    try:
+        QUERY_CACHE[cache_key] = {
+            "response": result,
+            "time": time.time()
+        }
+    except Exception:
+        pass  # never allow caching to break the app
+
+    return result
+
+# FLASK APP
+# -------------------------------------------------
 app = Flask(__name__, static_folder='static')
 
-# -------------------------
-# Session cookie / per-visitor SID handling
-# -------------------------
 SESSION_COOKIE_NAME = "sid"
 SESSION_COOKIE_TTL_DAYS = 365 * 2
 
@@ -627,10 +735,6 @@ def _make_sid():
 
 @app.before_request
 def ensure_sid_cookie():
-    """
-    Ensure every visitor has a session id cookie. We place it in `g.sid` so endpoints can use it.
-    Precedence: payload sid > query sid > cookie sid > new generated sid
-    """
     sid_from_cookie = request.cookies.get(SESSION_COOKIE_NAME, "").strip()
     sid_from_query = (request.args.get('sid') or "").strip()
     sid_from_payload = ""
@@ -638,7 +742,6 @@ def ensure_sid_cookie():
         sid_from_payload = (request.get_json(silent=True) or {}).get('sid') or ""
     except Exception:
         sid_from_payload = ""
-
     sid = sid_from_payload or sid_from_query or sid_from_cookie or _make_sid()
     g.sid = sid
     g.set_sid_cookie = (sid != sid_from_cookie)
@@ -647,16 +750,26 @@ def ensure_sid_cookie():
 def set_sid_cookie(response):
     try:
         if getattr(g, "set_sid_cookie", False):
-            secure_flag = not app.debug
+            secure_flag = True
+            try:
+                if app.debug or request.host.startswith("localhost"):
+                    secure_flag = False
+            except Exception:
+                secure_flag = True
+            samesite_val = 'None' if secure_flag else 'Lax'
             response.set_cookie(
                 SESSION_COOKIE_NAME,
                 g.sid,
                 max_age=SESSION_COOKIE_TTL_DAYS * 24 * 3600,
                 httponly=True,
-                samesite='Lax',
+                samesite=samesite_val,
                 secure=secure_flag,
                 path="/"
             )
+            try:
+                response.headers['X-Debug-SID'] = g.sid
+            except Exception:
+                pass
     except Exception:
         pass
     return response
@@ -669,419 +782,192 @@ def index():
 def chat():
     payload = request.json or {}
     question = (payload.get('message') or "").strip()
-    qlow = question.lower()
-
-    # --- Column list handler ---
-    if re.search(r'\b(show|list|display|give|what are)\b.*\b(columns|fields|attributes|headings)\b', qlow):
-        try:
-            cols = COLS
-            cols_html = "<br>".join(f"{i+1}. <strong>{c}</strong>" for i, c in enumerate(cols))
-            return jsonify({
-                "reply": f"The dataset contains {len(cols)} columns.",
-                "table_html": cols_html,
-                "columns": cols
-            })
-        except Exception as e:
-            return jsonify({"reply": f"Error fetching columns: {e}"}), 500
-
-    # Handle relative time queries
-    rel = handle_relative_time(question)
-        # --- right after: rel = handle_relative_time(question) --
-
-    # Ensure the relative-time filter uses a real date column in your SQL Server table.
-    if rel and isinstance(rel, dict) and rel.get("action") == "filter":
-        # detect a date column that actually exists (falling back to what's auto-detected)
-        try:
-            date_col = get_existing_date_column()  # helper already present in your file
-        except Exception:
-            date_col = DETECTED.get('date') or 'SaleDate'
-
-        # replace the placeholder sale_date_parsed (if present) with the real column name
-        rel_filter_sql = rel.get('filter_sql', '')
-        # common mismatches: sale_date_parsed or SaleDate_parsed etc. replace any "sale_date_parsed" token
-        rel_filter_sql = re.sub(r"\bsale_date_parsed\b", date_col, rel_filter_sql, flags=re.IGNORECASE)
-
-        # update rel so the rest of your code uses the fixed filter expression
-        rel['filter_sql'] = rel_filter_sql
-
-    if rel:
-        if rel["action"] == "now":
-            return jsonify({"reply": f"Current date & time (Asia/Kolkata): {rel['text']}"})
-
-        if rel["action"] == "filter":
-            ql = question.lower()
-            rev_col = DETECTED.get('revenue') or 'NetAfterCb'
-            profit_col = DETECTED.get('profit') or 'Profit'
-            date_col = get_existing_date_column()
-
-            # revenue query
-            if any(tok in ql for tok in ("revenue", "sales", "amount", "total")):
-                date_col = get_existing_date_column()
-                # only include rows where revenue-like column is present
-                rev_check = f"({rev_col} IS NOT NULL AND {rev_col} <> '')" if rev_col else "1=1"
-                sql = f"""
-                    SELECT FORMAT({date_col}, 'yyyy-MM') AS month,
-                        SUM(COALESCE(TRY_CAST(ProviderPaid AS FLOAT), 0)) AS revenue,
-                        COUNT(*) AS orders
-                    FROM {TABLE}
-                    WHERE {rel['filter_sql']} AND {rev_check}
-                    GROUP BY FORMAT({date_col}, 'yyyy-MM')
-                    ORDER BY month;
-                """
-                try:
-                    df = run_sql_and_fetch_df(sql, con)
-                    # drop null/empty group keys (first column) for display/explanation
-                    if not df.empty:
-                        first_col = df.columns[0]
-                        df = df[df[first_col].notna() & (df[first_col].astype(str).str.strip() != "")]
-                    table_html = rows_to_html_table(df.to_dict(orient='records')) if not df.empty else "<p><i>No data</i></p>"
-                    plot_uri = None
-                    if not df.empty:
-                        plot_uri = plot_to_base64(df['month'].astype(str).tolist(), df['revenue'].fillna(0).tolist(), kind='line', title=question)
-                    explanation = ask_model_explain(question, sql, df.head(8)) if not df.empty else "No data available."
-                    return jsonify({"reply": explanation, "sql": sql, "table_html": table_html, "plot_data_uri": plot_uri})
-                except Exception as e:
-                    return jsonify({"reply": f"Error executing SQL: {e}", "sql": sql}), 500
-            # installation / disconnection rates
-            if any(tok in ql for tok in ("install", "installation", "disconnection", "disconnect", "installation rate", "disconnection rate")):
-                date_col = get_existing_date_column()
-                sql = f"""
-                    SELECT FORMAT({date_col}, 'yyyy-MM') AS month,
-                        COUNT(*) AS total_orders,
-                        SUM(CASE WHEN (install_date_parsed IS NOT NULL OR InstallDate IS NOT NULL OR IsInstalled = 1) THEN 1 ELSE 0 END) AS installations,
-                        SUM(CASE WHEN (DisconnectDate IS NOT NULL OR LOWER(COALESCE(Status,'')) LIKE '%disconnect%') THEN 1 ELSE 0 END) AS disconnections
-                    FROM {TABLE}
-                    WHERE {rel['filter_sql']}
-                    GROUP BY FORMAT({date_col}, 'yyyy-MM')
-                    ORDER BY month;
-                """
-                try:
-                    df = run_sql_and_fetch_df(sql, con)
-                    if not df.empty:
-                        first_col = df.columns[0]
-                        df = df[df[first_col].notna() & (df[first_col].astype(str).str.strip() != "")]
-                    table_html = rows_to_html_table(df.to_dict(orient='records')) if not df.empty else "<p><i>No data</i></p>"
-                    plot_uri = None
-                    if not df.empty:
-                        plot_uri = plot_to_base64(df['month'].astype(str).tolist(), df['installations'].fillna(0).tolist(), kind='bar', title=question)
-                    explanation = ask_model_explain(question, sql, df.head(8)) if not df.empty else f"No install/disconnect info for {rel['meta']}"
-                    return jsonify({"reply": explanation, "sql": sql, "table_html": table_html, "plot_data_uri": plot_uri, "rows_returned": len(df)})
-                except Exception as e:
-                    return jsonify({"reply": f"Error executing filtered install/disconnect query: {e}", "sql": sql}), 500
-
-
-            # profit query
-            if any(tok in ql for tok in ("profit", "profits", "net profit", "total profit")):
-                date_col = get_existing_date_column()
-                profit_check = f"({profit_col} IS NOT NULL AND {profit_col} <> '')" if profit_col else "1=1"
-                sql = f"""
-                    SELECT FORMAT({date_col}, 'yyyy-MM') AS month,
-                        SUM(COALESCE(TRY_CAST({profit_col} AS FLOAT), 0)) AS profit,
-                        COUNT(*) AS orders
-                    FROM {TABLE}
-                    WHERE {rel['filter_sql']} AND {profit_check}
-                    GROUP BY FORMAT({date_col}, 'yyyy-MM')
-                    ORDER BY month;
-                """
-                try:
-                    df = run_sql_and_fetch_df(sql, con)
-                    if not df.empty:
-                        first_col = df.columns[0]
-                        df = df[df[first_col].notna() & (df[first_col].astype(str).str.strip() != "")]
-                    table_html = rows_to_html_table(df.to_dict(orient='records')) if not df.empty else "<p><i>No data</i></p>"
-                    plot_uri = None
-                    if not df.empty:
-                        plot_uri = plot_to_base64(df['month'].astype(str).tolist(), df['profit'].fillna(0).tolist(), kind='line', title=question)
-                    return jsonify({"reply": f"Profit details for {rel['meta']}", "sql": sql, "table_html": table_html, "plot_data_uri": plot_uri})
-                except Exception as e:
-                    return jsonify({"reply": f"Error executing SQL: {e}", "sql": sql}), 500
-
-
-            # order count
-            if any(tok in ql for tok in ("order", "orders", "count")):
-                date_col = get_existing_date_column()
-                sql = f"""
-                    SELECT FORMAT({date_col}, 'yyyy-MM') AS month,
-                        COUNT(*) AS orders
-                    FROM {TABLE}
-                    WHERE {rel['filter_sql']}
-                    GROUP BY FORMAT({date_col}, 'yyyy-MM')
-                    ORDER BY month;
-                """
-                try:
-                    df = run_sql_and_fetch_df(sql, con)
-                    if not df.empty:
-                        first_col = df.columns[0]
-                        df = df[df[first_col].notna() & (df[first_col].astype(str).str.strip() != "")]
-                    table_html = rows_to_html_table(df.to_dict(orient='records')) if not df.empty else "<p><i>No data</i></p>"
-                    explanation = ask_model_explain(question, sql, df.head(8)) if not df.empty else "No data available."
-                    return jsonify({"reply": explanation, "sql": sql, "table_html": table_html})
-                except Exception as e:
-                    return jsonify({"reply": f"Error executing SQL: {e}", "sql": sql}), 500
-
-
+    history = payload.get('history') or []
     if not question:
         return jsonify({"error": "No message provided"}), 400
 
-    # metadata
-    if re.search(r'\bhow many rows\b|\bnumber of rows\b', qlow):
+    qlow = question.lower()
+    print(f"Q: {question}")
+
+    # quick date helpers
+    if any(phrase in qlow for phrase in [
+        "what year is this",
+        "what year is it now",
+        "current year",
+        "this year now",
+        "what is today's year",
+    ]):
+        return jsonify({"reply": f"The current year is {dtmod.date.today().year}.", "table_html": "", "plot_data_uri": None})
+
+    if any(phrase in qlow for phrase in [
+        "what month is this",
+        "current month",
+        "what month are we in",
+    ]):
+        today = dtmod.date.today()
+        return jsonify({"reply": f"We are currently in {today.strftime('%B %Y')}.", "table_html": "", "plot_data_uri": None})
+
+    if any(phrase in qlow for phrase in [
+        "what was last year",
+        "last year is what",
+        "which year was last year",
+        "previous year",
+    ]):
+        return jsonify({"reply": f"Last year was {dtmod.date.today().year - 1}.", "table_html": "", "plot_data_uri": None})
+
+    if any(phrase in qlow for phrase in [
+        "what is today",
+        "today's date",
+        "what day is today",
+        "what date is today",
+    ]):
+        today = dtmod.date.today()
+        return jsonify({"reply": f"Today's date is {today.strftime('%B %d, %Y')}.", "table_html": "", "plot_data_uri": None})
+
+    intent = classify_intent(question)
+
+    # IMPORTANT: no "Hi!" auto message (you said you don't want it)
+        # Smalltalk
+    if intent == "smalltalk":
+        return jsonify({
+            "reply": "Hello 👋 I’m BundleAI. Ask me anything about your dataset — or click “Sample questions you can ask” to run examples.",
+            "table_html": "",
+            "plot_data_uri": None
+        })
+
+    # Meta / schema
+    if intent == "meta":
+        cols_html = "<br>".join(f"{i+1}. <strong>{escape(c)}</strong>" for i, c in enumerate(COLS))
+        return jsonify({
+            "reply": f"This dataset uses table '{TABLE}' with {ROWCOUNT or 'unknown'} rows and {len(COLS)} columns.",
+            "table_html": cols_html,
+            "plot_data_uri": None
+        })
+
+    # Row/column count quick question
+    if re.search(r'\bhow many rows\b|\brow count\b|\bnumber of rows\b', qlow):
         try:
-            cur = get_cursor()
-            cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
-            rows = cur.fetchone()[0]
-            try:
-                cur.close()
-            except Exception:
-                pass
-            return jsonify({"reply": f"The dataset contains {rows:,} rows."})
+            rows = ROWCOUNT
+            if rows is None:
+                with _get_duck_con() as local_con:
+                    rows = local_con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+            cols = len(COLS)
+            return jsonify({"reply": f"The dataset contains {rows:,} rows and {cols} columns.", "table_html": "", "plot_data_uri": None})
         except Exception as e:
-            return jsonify({"reply": f"Could not count rows: {e}"}), 500
+            _log_and_mask_error(e, "count_rows_cols")
+            return jsonify(_safe_user_error("Could not determine rows/cols right now.")), 500
 
-    # generate SQL using LLM
-    schema_cols = COLS
+    resp = handle_general_data_question(question, history=history)
+
+    # Ensure no LaTeX leaks
     try:
-        sample_rows = run_sql_and_fetch_df(f"SELECT TOP 50 * FROM {TABLE}", con)
+        if isinstance(resp, dict) and "reply" in resp:
+            resp["reply"] = strip_latex_math(resp.get("reply") or "")
     except Exception:
-        sample_rows = SAMPLE_DF if not SAMPLE_DF.empty else pd.DataFrame(columns=COLS)
+        pass
 
-    sql_text = ask_model_for_sql(question, schema_cols, sample_rows)
-    if sql_text.strip().upper() == "NO_SQL":
-        sample_csv = sample_rows.head(20).to_csv(index=False) if not sample_rows.empty else "no sample rows"
-        prompt = f"Columns: {', '.join(COLS)}\nSample:\n{sample_csv}\nQuestion: {question}"
-        resp = client.chat.completions.create(model=CHAT_MODEL, messages=[{"role": "system", "content": "You are a data analyst."}, {"role": "user", "content": prompt}], temperature=0.2)
-        return jsonify({"reply": resp.choices[0].message.content})
+    return jsonify(resp)
 
-    sql_text = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql_text, flags=re.IGNORECASE).strip()
-    sql_text = re.sub(r"\bdataset\b", TABLE, sql_text, flags=re.IGNORECASE)
-    sql_text = normalize_sql_columns(sql_text)
+# -------------------------------------------------
+# DOWNLOAD ENDPOINT FOR EXCEL (in-memory only)
+# -------------------------------------------------
+@app.route("/download/<token>")
+def download_result(token):
+    data = EXPORT_CACHE.get(token)
+    if data is None:
+        return "File not found or expired", 404
 
-    if not is_safe_select(sql_text):
-        return jsonify({"reply": "Generated SQL blocked for safety."}), 400
+    output = BytesIO()
 
-    try:
-        df = run_sql_and_fetch_df(sql_text, con)
-    except Exception as e:
-        # try one LLM-based auto-fix attempt
-        try:
-            fixed = ask_model_fix_sql(sql_text, str(e), schema_cols, sample_rows)
-            if fixed and fixed.strip().upper() != "NO_SQL":
-                fixed = re.sub(r"^```(?:sql)?\s*|\s*```$", "", fixed, flags=re.IGNORECASE).strip()
-                fixed = re.sub(r"\bdataset\b", TABLE, fixed, flags=re.IGNORECASE)
-                fixed = normalize_sql_columns(fixed)
-                if not is_safe_select(fixed):
-                    return jsonify({"reply":"Auto-fixed SQL blocked for safety."}), 400
-                try:
-                    df = run_sql_and_fetch_df(fixed, con)
-                    sql_text = fixed
-                except Exception as e2:
-                    return jsonify({"reply": f"SQL execution error after auto-fix: {e2}", "sql": fixed}), 500
-            else:
-                return jsonify({"reply": f"SQL execution error: {e}", "sql": sql_text}), 500
-        except Exception:
-            return jsonify({"reply": f"SQL execution error: {e}", "sql": sql_text}), 500
-        # --- START: drop NULL/empty group labels so UI doesn't show "null" as top bucket ---
-    # Defensive: ensure df was created by the block above
-    if 'df' not in locals():
-        return jsonify({"reply": "No data returned from query.", "sql": sql_text}), 500
+    if isinstance(data, dict):
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            for sheet_name, df in data.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        df = data
+        df.to_excel(output, index=False)
 
-    # If DataFrame returned, drop rows where the first column (group label) is NULL or empty.
-    # Prefer non-null groups. If ALL are null/empty, attempt a fallback SQL that explicitly excludes nulls.
-    if df is not None and not df.empty:
-        first_col = df.columns[0]
-        try:
-            # mask of meaningful group labels
-            non_null_mask = df[first_col].notna() & (df[first_col].astype(str).str.strip() != "")
-            if non_null_mask.any():
-                # There are valid group labels — remove the null/empty rows
-                df = df[non_null_mask]
-            else:
-                # All group labels are NULL/empty — attempt to re-run SQL excluding nulls.
-                # Build a safety exclusion expression for the group column.
-                group_col = first_col
-                excl = f"{group_col} IS NOT NULL AND LTRIM(RTRIM(COALESCE({group_col},''))) <> ''"
+    output.seek(0)
+    EXPORT_CACHE.pop(token, None)
 
-                new_sql = None
-                try:
-                    # If original SQL already contains a WHERE, inject the exclusion at the start of the WHERE.
-                    if re.search(r"\bWHERE\b", sql_text, flags=re.IGNORECASE):
-                        # inject excl after the first WHERE
-                        new_sql = re.sub(r"(\bWHERE\b\s*)", r"\1" + excl + " AND ", sql_text, flags=re.IGNORECASE, count=1)
-                    else:
-                        # No WHERE — try inserting before GROUP BY or ORDER BY if present, otherwise append WHERE
-                        if re.search(r"\bGROUP\s+BY\b", sql_text, flags=re.IGNORECASE):
-                            new_sql = re.sub(r"(\bGROUP\s+BY\b)", "WHERE " + excl + " \\1", sql_text, flags=re.IGNORECASE, count=1)
-                        elif re.search(r"\bORDER\s+BY\b", sql_text, flags=re.IGNORECASE):
-                            new_sql = re.sub(r"(\bORDER\s+BY\b)", "WHERE " + excl + " \\1", sql_text, flags=re.IGNORECASE, count=1)
-                        else:
-                            new_sql = sql_text + " WHERE " + excl
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="result.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-                    # Try executing fallback query (if we produced one)
-                    if new_sql:
-                        try:
-                            df2 = run_sql_and_fetch_df(new_sql, con)
-                            # if fallback returned rows, use them (and update sql_text to reflect real executed SQL)
-                            if df2 is not None and not df2.empty:
-                                df = df2
-                                sql_text = new_sql
-                        except Exception:
-                            # fallback failed — keep original df
-                            pass
-                except Exception:
-                    # any unexpected error during fallback — ignore and keep original df
-                    pass
-        except Exception:
-            # If something goes wrong (type coercion etc.), don't modify df
-            pass
-    # --- END: drop NULL/empty group labels ---
-
-    df_preview = df.head(MAX_ROWS)
-    table_html = rows_to_html_table(df_preview.to_dict(orient='records')) if not df_preview.empty else "<p><i>No data</i></p>"
-
-    plot_uri = None
-    try:
-        if not df.empty:
-            if 'month' in df.columns:
-                ycol = next((c for c in df.columns if c != 'month' and pd.api.types.is_numeric_dtype(df[c])), None)
-                if ycol:
-                    plot_uri = plot_to_base64(df['month'].astype(str).tolist(), df[ycol].fillna(0).tolist(), kind='line', title=question)
-            elif df.shape[1] >= 2 and pd.api.types.is_numeric_dtype(df.iloc[:,1]):
-                labels = df.iloc[:,0].astype(str).tolist()
-                vals = df.iloc[:,1].astype(float).fillna(0).tolist()
-                plot_uri = plot_to_base64(labels, vals, kind='bar', title=question)
-    except Exception as e:
-        print("Plot error:", e, traceback.format_exc())
-
-    explanation = "No data found."
-    if not df_preview.empty:
-        preview_rows = df_preview.head(50).to_dict(orient='records')
-        try:
-            prompt = f"Question: {question}\nSQL: {sql_text}\nPreview:\n{json.dumps(preview_rows)}"
-            resp = client.chat.completions.create(model=CHAT_MODEL, messages=[{"role": "system", "content": "You are a concise analyst."}, {"role": "user", "content": prompt}], temperature=0.0)
-            explanation = resp.choices[0].message.content.strip()
-        except Exception:
-            explanation = f"Here are the results for: {question}"
-
-    return jsonify({
-        "reply": explanation,
-        "sql": sql_text,
-        "table_html": table_html,
-        "plot_data_uri": plot_uri,
-        "rows_returned": len(df),
-        "truncated": len(df) > MAX_ROWS
-    })
-
-# -------------------------
-# Memory DB (SQLite) implementation (CONSOLIDATED/CORRECTED)
-# -------------------------
-# We'll keep the same function names (_load_conversations, _save_conversations) that your endpoints call,
-# but back them with a single SQLite database to avoid JSON file race conditions and scale better.
-# -------------------------
-# Memory DB (SQLite) implementation (CONSOLIDATED/CORRECTED + safe migration)
-# -------------------------
-# We'll keep the same function names (_load_conversations, _save_conversations) that your endpoints call,
-# but back them with a single SQLite database to avoid JSON file race conditions and scale better.
+# -------------------------------------------------
+# MEMORY MANAGEMENT (SQLite + JSON fallback)
+# -------------------------------------------------
+MEMORY_FILE = Path('./data/conversations.json')
+MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = Path('./data/chat_memory.db')
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def _ensure_chats_table_and_migration(db_path: Path):
-    """
-    Ensure the chats table exists with the canonical schema:
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      created_at INTEGER,
-      session_id TEXT,
-      messages_json TEXT
-    If the table exists but session_id or messages_json is missing, add them.
-    """
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        # create table if missing with minimal columns (include session_id and messages_json if possible)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 id TEXT PRIMARY KEY,
                 title TEXT,
                 created_at INTEGER
-                -- session_id and messages_json may be added by migration below
             );
         """)
         conn.commit()
 
-        # fetch existing columns
         cur.execute("PRAGMA table_info(chats);")
-        existing_cols = [r[1] for r in cur.fetchall()]  # r[1] is column name
+        existing_cols = [r[1] for r in cur.fetchall()]
 
-        # add session_id column if missing
         if 'session_id' not in existing_cols:
             try:
                 cur.execute("ALTER TABLE chats ADD COLUMN session_id TEXT;")
                 conn.commit()
-                print("Migration: added 'session_id' column to chats table.")
-            except Exception as e:
-                print("⚠️ Failed to add session_id column during migration:", e)
+            except Exception:
+                pass
 
-        # add messages_json column if missing
         cur.execute("PRAGMA table_info(chats);")
         existing_cols = [r[1] for r in cur.fetchall()]
+
         if 'messages_json' not in existing_cols:
             try:
                 cur.execute("ALTER TABLE chats ADD COLUMN messages_json TEXT;")
                 conn.commit()
-                print("Migration: added 'messages_json' column to chats table.")
-            except Exception as e:
-                print("⚠️ Failed to add messages_json column during migration:", e)
+            except Exception:
+                pass
 
-        # close cursor
-        try:
-            cur.close()
-        except Exception:
-            pass
+        cur.close()
     finally:
         conn.close()
 
-# Run migration once at startup
-_ensure_chats_table_and_migration(DB_PATH)
-
 def _row_to_conv(row):
-    """Convert sqlite row (id,title,created_at,session_id,messages_json) -> dict as before."""
-    # row may vary depending on schema/order; handle flexibly
     try:
-        # If row is tuple of 4 or 5 items, attempt to map accordingly
         if len(row) == 4:
             cid, title, created_at, messages_json = row
             session_id = ""
         elif len(row) == 5:
             cid, title, created_at, session_id, messages_json = row
         else:
-            # fallback: try indexing by known names if row is sqlite3.Row (mapping)
-            try:
-                cid = row['id']
-                title = row.get('title')
-                created_at = row.get('created_at', 0)
-                session_id = row.get('session_id', '')
-                messages_json = row.get('messages_json', '')
-            except Exception:
-                # ultimate fallback
-                cid = row[0]
-                title = row[1] if len(row) > 1 else None
-                created_at = row[2] if len(row) > 2 else 0
-                session_id = row[3] if len(row) > 3 else ''
-                messages_json = row[4] if len(row) > 4 else ''
-    except Exception:
-        # safe defaults on any unexpected shape
-        try:
             cid = row[0]
-        except Exception:
-            cid = "unknown"
+            title = row[1] if len(row) > 1 else None
+            created_at = row[2] if len(row) > 2 else 0
+            session_id = row[3] if len(row) > 3 else ''
+            messages_json = row[4] if len(row) > 4 else ''
+    except Exception:
+        cid = row[0] if row else "unknown"
         title = ""
         created_at = 0
         session_id = ""
         messages_json = ""
+
     try:
         messages = json.loads(messages_json) if messages_json else []
     except Exception:
         messages = []
+
     return {
         "id": cid,
         "title": title,
@@ -1091,19 +977,22 @@ def _row_to_conv(row):
     }
 
 def _load_conversations():
-    """Return all saved chats as a dict."""
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
-            # attempt to select including messages_json and session_id
             try:
-                rows = cur.execute("SELECT id, title, created_at, session_id, messages_json FROM chats ORDER BY created_at DESC").fetchall()
+                rows = cur.execute(
+                    "SELECT id, title, created_at, session_id, messages_json "
+                    "FROM chats ORDER BY created_at DESC"
+                ).fetchall()
             except Exception:
-                # fallback if schema older
-                rows = cur.execute("SELECT id, title, created_at, messages_json FROM chats ORDER BY created_at DESC").fetchall()
+                rows = cur.execute(
+                    "SELECT id, title, created_at, messages_json "
+                    "FROM chats ORDER BY created_at DESC"
+                ).fetchall()
+
         out = {}
         for r in rows:
-            # use helper to parse row flexibly
             conv = _row_to_conv(r)
             out[conv['id']] = {
                 "id": conv['id'],
@@ -1112,47 +1001,40 @@ def _load_conversations():
                 "messages": conv.get("messages", [])
             }
         return out
-    except Exception as e:
-        print("⚠️ Failed to load chats from DB:", e)
-        # fallback: if JSON file exists, read it (keeps compatibility)
+    except Exception:
         try:
             if MEMORY_FILE.exists():
                 return json.load(open(MEMORY_FILE, 'r', encoding='utf8'))
-        except Exception as ex:
-            print("⚠️ Fallback JSON load failed:", ex)
+        except Exception:
+            pass
         return {}
 
 def _save_conversation_single(chat_id, title, created_at, messages, session_id=""):
-    """Save or update a single chat record (tries SQLite first, then fallback JSON)."""
-    # ensure migration ran before we attempt to save (defensive)
     _ensure_chats_table_and_migration(DB_PATH)
-
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
-            # use INSERT OR REPLACE: make sure the table supports session_id and messages_json
             cur = conn.cursor()
-            # ensure columns exist
             cur.execute("PRAGMA table_info(chats);")
             existing_cols = [r[1] for r in cur.fetchall()]
+
             if 'session_id' in existing_cols and 'messages_json' in existing_cols:
                 cur.execute(
-                    "INSERT OR REPLACE INTO chats (id, title, created_at, session_id, messages_json) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO chats (id, title, created_at, session_id, messages_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     (chat_id, title, created_at, session_id, json.dumps(messages))
                 )
             elif 'messages_json' in existing_cols:
-                # older schema without session_id
                 cur.execute(
-                    "INSERT OR REPLACE INTO chats (id, title, created_at, messages_json) VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO chats (id, title, created_at, messages_json) "
+                    "VALUES (?, ?, ?, ?)",
                     (chat_id, title, created_at, json.dumps(messages))
                 )
             else:
-                # minimal schema (very old) - try to store messages in JSON file instead
                 raise RuntimeError("SQLite schema missing messages_json column")
+
             conn.commit()
         return True
-    except Exception as e:
-        print(f"⚠️ Failed to save chat {chat_id} to SQLite DB:", e)
-        # fallback: persist to JSON file as a best-effort fallback
+    except Exception:
         try:
             all_conv = {}
             if MEMORY_FILE.exists():
@@ -1160,8 +1042,6 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
                     all_conv = json.load(open(MEMORY_FILE, 'r', encoding='utf8'))
                 except Exception:
                     all_conv = {}
-            # use session_id in JSON structure nested per-session for compatibility
-            # previous format stored flat dict by id; to avoid breaking older clients, keep flat structure but embed session_id
             all_conv[chat_id] = {
                 "id": chat_id,
                 "title": title,
@@ -1171,71 +1051,73 @@ def _save_conversation_single(chat_id, title, created_at, messages, session_id="
             }
             with open(MEMORY_FILE, 'w', encoding='utf8') as f:
                 json.dump(all_conv, f, ensure_ascii=False, indent=2)
-            print(f"Saved chat {chat_id} to fallback JSON file.")
             return True
-        except Exception as ex:
-            print("Fallback JSON save also failed:", ex)
+        except Exception:
             return False
-
-# -------------------------
-# Flask Memory Endpoints (use the consolidated DB functions)
-# -------------------------
 
 @app.route('/memory/list', methods=['GET'])
 def memory_list():
-    """List saved chat sessions (for sidebar). Supports optional 'sid' query param to scope chats per-session."""
-    # prefer cookie/session id
     sid = (getattr(g, "sid", "") or request.args.get('sid') or "").strip()
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
-            # determine if session_id column exists
             cur.execute("PRAGMA table_info(chats);")
             cols = [r[1] for r in cur.fetchall()]
+
             if sid and 'session_id' in cols:
                 rows = cur.execute(
                     "SELECT id, title, created_at FROM chats WHERE session_id = ? ORDER BY created_at DESC",
                     (sid,)
                 ).fetchall()
             else:
-                # if no sid provided or no session column, list all (backwards compatible)
                 rows = cur.execute(
                     "SELECT id, title, created_at FROM chats ORDER BY created_at DESC"
                 ).fetchall()
-        chats = [
-            {"id": r[0], "title": r[1] or "Chat", "created_at": r[2]}
-            for r in rows
-        ]
+
+        chats = [{"id": r[0], "title": r[1] or "Chat", "created_at": r[2]} for r in rows]
+
+        # ALWAYS include sample chat at top (even if user has no chats)
+        chats = [c for c in chats if c.get("id") != SAMPLE_CHAT_ID]
+        chats.insert(0, {"id": SAMPLE_CHAT_ID, "title": SAMPLE_CHAT_TITLE, "created_at": SAMPLE_CHAT_CREATED_AT})
+
         return jsonify({"chats": chats})
+
     except Exception as e:
-        # fallback to JSON if SQLite fails
         try:
             conv = _load_conversations()
             items = []
             for k, v in conv.items():
-                # if sid provided, filter by session_id field stored in JSON
                 if sid:
                     if isinstance(v, dict) and v.get("session_id") and v.get("session_id") != sid:
                         continue
                 items.append({"id": k, "title": v.get("title") or "Chat", "created_at": v.get("created_at", 0)})
+
             items.sort(key=lambda x: x['created_at'] or 0, reverse=True)
+
+            items = [c for c in items if c.get("id") != SAMPLE_CHAT_ID]
+            items.insert(0, {"id": SAMPLE_CHAT_ID, "title": SAMPLE_CHAT_TITLE, "created_at": SAMPLE_CHAT_CREATED_AT})
+
             return jsonify({"chats": items})
         except Exception:
             return jsonify({"error": f"Failed to list chats: {e}"}), 500
 
 @app.route('/memory/load', methods=['GET'])
 def memory_load():
-    """Load a specific chat by ID. Optional query param 'sid' will restrict to that session's data."""
     cid = (request.args.get('id') or "").strip()
     sid = (getattr(g, "sid", "") or (request.args.get('sid') or "")).strip()
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
+
+    # ALWAYS return sample chat from code (never from DB), so it can’t get polluted by old messages
+    if cid == SAMPLE_CHAT_ID:
+        return jsonify(SAMPLE_CHAT)
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
-            # check schema to know whether session_id exists
             cur.execute("PRAGMA table_info(chats);")
             cols = [r[1] for r in cur.fetchall()]
+
             if sid and 'session_id' in cols:
                 row = cur.execute(
                     "SELECT id, title, created_at, session_id, messages_json FROM chats WHERE id = ? AND session_id = ?",
@@ -1246,22 +1128,20 @@ def memory_load():
                     "SELECT id, title, created_at, messages_json FROM chats WHERE id = ?",
                     (cid,)
                 ).fetchone()
+
         if not row:
-            # fallback to JSON
             conv = _load_conversations()
             conv_row = conv.get(cid)
             if conv_row:
-                # if sid provided and conv_row has session_id, enforce it
                 if sid and conv_row.get("session_id") and conv_row.get("session_id") != sid:
                     return jsonify({"error": "Chat not found"}), 404
                 return jsonify(conv_row)
             return jsonify({"error": "Chat not found"}), 404
-        # build response based on row shape
-        # row could be 4 or 5 columns depending on schema; helper handles it
+
         conv = _row_to_conv(row)
-        # If sid is provided and stored session_id doesn't match, return not found
         if sid and conv.get("session_id") and conv.get("session_id") != sid:
             return jsonify({"error": "Chat not found"}), 404
+
         return jsonify({
             "id": conv["id"],
             "title": conv.get("title") or "Chat",
@@ -1273,11 +1153,14 @@ def memory_load():
 
 @app.route('/memory/save', methods=['POST'])
 def memory_save():
-    """Save or update a conversation. Accepts 'sid' in payload to scope the chat to a session (per-visitor)."""
     payload = request.get_json(force=True) or {}
-    # prefer server-detected session id (cookie) or fallback to payload (rare)
-    sid = (getattr(g, "sid", "") or payload.get('sid') or "").strip()
+    sid = (getattr(g, "sid") or payload.get('sid') or "").strip()
     cid = payload.get('id') or f"chat-{int(time.time() * 1000)}"
+
+    # Block saving sample chat forever
+    if cid == SAMPLE_CHAT_ID:
+        return jsonify({"ok": True, "id": cid})
+
     title = payload.get('title') or 'Chat'
     created_at = payload.get('created_at') or int(time.time() * 1000)
     messages = payload.get('messages') or []
@@ -1287,34 +1170,47 @@ def memory_save():
         return jsonify({"error": "Failed to save chat"}), 500
     return jsonify({"ok": True, "id": cid})
 
+@app.route("/health", methods=["GET"])
+def health():
+    try:
+        with _get_duck_con() as local_con:
+            local_con.execute("SELECT 1")
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("SELECT 1")
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "details": str(e)}), 500
+
 @app.route('/memory/delete', methods=['POST'])
 def memory_delete():
-    """Delete a chat by ID. If payload contains 'sid', deletion will only remove the chat for that session."""
     payload = request.get_json(force=True) or {}
     cid = payload.get('id')
     sid = (getattr(g, "sid", "") or payload.get('sid') or "").strip()
     if not cid:
         return jsonify({"error": "Missing chat ID"}), 400
+
+    if cid == SAMPLE_CHAT_ID:
+        return jsonify({"ok": False, "error": "Sample chat cannot be deleted"}), 400
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cur = conn.cursor()
-            # check if session_id column exists
             cur.execute("PRAGMA table_info(chats);")
             cols = [r[1] for r in cur.fetchall()]
+
             if sid and 'session_id' in cols:
                 cur.execute("DELETE FROM chats WHERE id = ? AND session_id = ?", (cid, sid))
             else:
-                # fallback: delete by id regardless of session (backwards compatible)
                 cur.execute("DELETE FROM chats WHERE id = ?", (cid,))
             conn.commit()
+
         return jsonify({"ok": True})
     except Exception as e:
-        # try fallback deletion from JSON
         try:
             if MEMORY_FILE.exists():
                 m = json.load(open(MEMORY_FILE, 'r', encoding='utf8'))
                 if cid in m:
-                    # if sid provided, verify session match before deleting
                     if sid and m[cid].get("session_id") and m[cid].get("session_id") != sid:
                         return jsonify({"error": "Chat not found"}), 404
                     m.pop(cid, None)
@@ -1325,9 +1221,7 @@ def memory_delete():
             pass
         return jsonify({"error": f"Failed to delete chat: {e}"}), 500
 
-# Run the Flask app
-# -------------------------
+# MAIN
 if __name__ == "__main__":
-    print(f"🚀 Starting server on http://localhost:{PORT}")
-    print(f"Connected to SQL Server table: {TABLE}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    print(f"Starting server on http://localhost:{PORT} — using table {TABLE}")
+    app.run(host="0.0.0.0", port=PORT)
