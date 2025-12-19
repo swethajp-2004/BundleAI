@@ -25,7 +25,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL =True
+DEBUG_SQL = True
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -33,7 +33,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DUCKDB_FILE = os.getenv("DUCKDB_FILE", "./data/sales.duckdb")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "3000"))
-MAX_ROWS = int(os.getenv("MAX_ROWS", "2000"))
+MAX_ROWS = 500
 QUERY_CACHE = {}      # { sql_text: { "response": result_dict, "time": timestamp } }
 CACHE_TTL = 30        # cache lifespan in seconds (you can increase to 60 if needed)
 
@@ -83,7 +83,8 @@ SAMPLE_MESSAGES = [
     {"role": "user", "text": "give top 10 product name, their profit , profit rate based on profit rate for 2024", "time": SAMPLE_CHAT_CREATED_AT + 8},
     {"role": "user", "text": "show me the cancellation count for provider spectrum where status = cancelled for august 2025", "time": SAMPLE_CHAT_CREATED_AT + 9},
     {"role": "user", "text": "show me the distinct status values", "time": SAMPLE_CHAT_CREATED_AT + 10},
-    {"role": "user", "text": "show me the top 5 company names based on their profit on 2025 in a pie chart", "time": SAMPLE_CHAT_CREATED_AT + 11}
+    {"role": "user", "text": "show me the top 5 company names based on their profit on 2025 in a pie chart", "time": SAMPLE_CHAT_CREATED_AT + 11},
+    {"role": "user", "text": "give me the details of the order id 1,602,248 from addon", "time": SAMPLE_CHAT_CREATED_AT + 12}
 ]
 
 SAMPLE_CHAT = {
@@ -108,6 +109,7 @@ PRED_MESSAGES = [
   {"role":"user","text":"show me the month wise profit rate and estimated profit rate for the product TV for 2025","time":PRED_CHAT_CREATED_AT+4},
   {"role":"user","text":"show month wise revenue for the product tv and also estimate the revenue for 2025","time":PRED_CHAT_CREATED_AT+5},
   {"role":"user","text":"what is the disconnected rate and estimated disconnected rate for the provider comcast for dec 2025.","time":PRED_CHAT_CREATED_AT+6},
+  {"role":"user","text":"give me the revenue,profit,profit rate and estimated profit rate for the Mainchannel Digital on 2025 from addon","time":PRED_CHAT_CREATED_AT+7},
 ]
 
 PRED_CHAT = {"id":PRED_CHAT_ID,"title":PRED_CHAT_TITLE,"created_at":PRED_CHAT_CREATED_AT,"messages":PRED_MESSAGES}
@@ -167,8 +169,7 @@ def find_best(cols, candidates):
 
 # Candidate lists
 REVENUE_CANDS = [
-    'NetAfterChargeback', 'NetAfterCb', 'GrossAfterCb',
-    'Revenue', 'ProviderPaid', 'Amount', 'SaleAmount'
+    'NetAfterChargeback', 'NetAfterCb'
 ]
 PROFIT_CANDS = ['Profit', 'NetProfit', 'ProfitAmount', 'Margin']
 DATE_CANDS = ['sale_date_parsed', 'SaleDate', 'Date', 'OrderDate']
@@ -258,7 +259,7 @@ def is_safe_select(sql: str) -> bool:
     return True
 def _wants_addon(question: str) -> bool:
     q = (question or "").lower()
-    return ("addon" in q) or ("add-on" in q) or ("add on" in q)
+    return ("addon" in q) or ("add on" in q)
 
 def _extract_addon_value(question: str):
     """
@@ -387,17 +388,12 @@ def apply_ltype_policy_to_sql(sql: str, question: str) -> str:
     if TABLE.lower() not in s_low:
         return sql
 
-    # If SQL already mentions these columns, don't override those parts
-    already_has_ltype = re.search(r"\b(where|having)\b[\s\S]*\bltype\b", s_low, re.IGNORECASE) is not None
-    already_has_addon = re.search(r"\baddon\b", s_low, flags=re.IGNORECASE) is not None
+    # If USER explicitly mentions Ltype, don't override it.
+    q_low = (question or "").lower()
+    user_explicit_ltype = re.search(r"\bltype\b", q_low) is not None
 
-    filt = policy_filter_sql(
-        question,
-        already_has_ltype=already_has_ltype,
-        already_has_addon=already_has_addon
-    )
-    if not filt:
-        return sql
+    # If SQL already mentions Addon, don't inject another addon filter
+    already_has_addon = re.search(r"\baddon\b", s_low, flags=re.IGNORECASE) is not None
 
     # ---------- helpers ----------
     def _find_clause_span(text: str, clause: str):
@@ -413,10 +409,6 @@ def apply_ltype_policy_to_sql(sql: str, question: str) -> str:
 
     # ---------- FIX HAVING problems BEFORE injecting ----------
     span_having = _find_clause_span(s, "HAVING")
-    span_group  = _find_clause_span(s, "GROUP")
-    # Note: we specifically care about "GROUP BY", but "GROUP" is good enough for ordering checks
-    # because GROUP BY always starts with GROUP.
-
     if span_having:
         has_group_by = re.search(r"\bGROUP\s+BY\b", s, flags=re.IGNORECASE) is not None
 
@@ -426,22 +418,71 @@ def apply_ltype_policy_to_sql(sql: str, question: str) -> str:
         else:
             # 2) HAVING before GROUP BY -> invalid ordering
             span_having2 = _find_clause_span(s, "HAVING")
-            span_group2  = _find_clause_span(s, "GROUP")
+            span_group2 = _find_clause_span(s, "GROUP")
             if span_having2 and span_group2 and span_having2[0] < span_group2[0]:
                 s = _replace_first_keyword(s, "HAVING", "WHERE")
 
     # refresh lowered string after potential edits
     s_low = s.lower()
 
+    # ---------- ADDON MODE NORMALIZATION ----------
+    addon_val, is_explicit = _extract_addon_value(question)
+
+    # If user says "addon" WITHOUT addon=0/1, addon is a MODE:
+    # - Do NOT filter Addon column at all (remove model-added Addon=1 / Addon IS NOT NULL etc.)
+    # - Force Ltype='A' only (no NULL), unless user explicitly asked Ltype
+    if _wants_addon(question) and (not is_explicit):
+        # Remove model-added Addon filters (common patterns)
+        s = re.sub(r"\bAND\s+\(?\s*Addon\s*=\s*1\s*\)?", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bAND\s+\(?\s*Addon\s*=\s*0\s*\)?", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bAND\s+\(?\s*Addon\s+IS\s+NOT\s+NULL\s*\)?", "", s, flags=re.IGNORECASE)
+
+        s = re.sub(r"\(?\s*Addon\s*=\s*1\s*\)?\s+AND\s+", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\(?\s*Addon\s*=\s*0\s*\)?\s+AND\s+", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\(?\s*Addon\s+IS\s+NOT\s+NULL\s*\)?\s+AND\s+", "", s, flags=re.IGNORECASE)
+
+        # clean up possible "WHERE  AND"
+        s = re.sub(r"\bWHERE\s+AND\b", "WHERE", s, flags=re.IGNORECASE)
+
+        # If model wrote (LType='A' OR LType IS NULL), replace with strict A only
+        if not user_explicit_ltype:
+            s = re.sub(
+                r"\(\s*LType\s*=\s*'A'\s*OR\s*LType\s+IS\s+NULL\s*\)",
+                "(TRIM(CAST(Ltype AS VARCHAR)) = 'A')",
+                s,
+                flags=re.IGNORECASE
+            )
+
+        s_low = s.lower()
+
+    # Build policy filter (based on question intent, not SQL content)
+    filt = policy_filter_sql(
+        question,
+        already_has_ltype=user_explicit_ltype,
+        already_has_addon=already_has_addon
+    )
+
+    if not filt:
+        return s
+
     # ---------- Inject filter into WHERE or create WHERE ----------
     span_where = _find_clause_span(s, "WHERE")
     if span_where:
-        # insert right after WHERE keyword
-        insert_at = span_where[1]  # position just after WHERE
-        head = s[:insert_at]
-        tail = s[insert_at:]
-        # WHERE <filt> AND (<existing conditions...>)
-        return f"{head} {filt} AND ({tail.strip()})"
+        # Everything after WHERE
+        where_start = span_where[1]
+        rest = s[where_start:]
+
+        # Split: conditions vs trailing clauses (GROUP BY / HAVING / ORDER BY / LIMIT)
+        m = re.search(r"\b(GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT)\b", rest, flags=re.IGNORECASE)
+        if m:
+            cond_part = rest[:m.start()].strip()
+            tail_part = rest[m.start():].lstrip()
+        else:
+            cond_part = rest.strip()
+            tail_part = ""
+
+        # Rebuild safely: WHERE (<old conditions>) AND (<policy>) <tail clauses>
+        return f"{s[:span_where[0]]}WHERE ({cond_part}) AND ({filt}) {tail_part}".strip()
 
     # No WHERE: insert before the earliest of GROUP BY / HAVING / ORDER BY / LIMIT (if any)
     cut_spans = []
@@ -452,9 +493,9 @@ def apply_ltype_policy_to_sql(sql: str, question: str) -> str:
 
     if cut_spans:
         cut = min(cut_spans)
-        return f"{s[:cut].rstrip()} WHERE {filt} {s[cut:].lstrip()}"
+        return f"{s[:cut].rstrip()} WHERE {filt} {s[cut:].lstrip()}".strip()
     else:
-        return f"{s} WHERE {filt}"
+        return f"{s} WHERE {filt}".strip()
 
 # Columns to hide by default in table output + excel download
 HIDDEN_COLS_DEFAULT = {
@@ -513,6 +554,28 @@ def apply_hidden_cols_policy(df: pd.DataFrame, question: str) -> pd.DataFrame:
     if to_drop:
         return df.drop(columns=to_drop, errors="ignore")
     return df
+
+def _extract_order_id(question: str):
+    """
+    Extract order id like:
+      - order id 1,188,032
+      - orderid 1188032
+    Returns int or None
+    """
+    q = (question or "")
+    m = re.search(r"\border\s*id\b\D*([\d,]{3,})", q, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\borderid\b\D*([\d,]{3,})", q, flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    raw = (m.group(1) or "").replace(",", "").strip()
+    if not raw.isdigit():
+        return None
+    return int(raw)
+def _wants_full_details(question: str) -> bool:
+    q = (question or "").lower()
+    return any(k in q for k in ["details", "full details", "show all", "all columns", "entire order"])
 
 def _extract_key_lookup(question: str):
     """
@@ -1205,6 +1268,8 @@ Technical rules:
   • "based on <metric>"
   • "by <dimension>"
   • rankings or comparisons
+- If the user says "addon" but does NOT specify addon=0 or addon=1, do NOT add any SQL filter on the Addon column (no Addon=1, no Addon IS NOT NULL). The server handles addon-mode.
+- If the user provides IDs with commas (e.g. 1,188,032), remove commas before using them in SQL.
 
   You MUST:
   1. GROUP BY the identifying column(s) (e.g. CompanyName, ProviderName)
@@ -1212,21 +1277,10 @@ Technical rules:
   3. ORDER BY the aggregated metric (DESC for top, ASC for bottom)
   4. Apply LIMIT N
 
-- IMPORTANT Addon/Ltype policy:
-  1) Default (no addon mentioned at all):
-     ALWAYS filter rows where (Ltype = 'L' OR Ltype IS NULL).
-  2) If user mentions "addon" (addon/add-on/add on) WITHOUT specifying a value:
-     treat it as addon-mode and filter rows where Ltype = 'A'.
-  3) If user explicitly says addon = 1:
-     filter rows where Addon = 1
-     and DO NOT force any Ltype (unless the user explicitly asks Ltype).
-  4) If user explicitly says addon = 0:
-     filter rows where Addon = 0
-     and behave like default for Ltype again (Ltype='L' OR NULL), unless the user explicitly asks Ltype.
-  5) If user explicitly asks Ltype (e.g. Ltype = 'A') then respect that and do not override it.
+- Addon/Ltype filtering is handled by the server automatically. Do NOT add any filters on Ltype or Addon unless the user explicitly asks for Ltype=... or Addon=...
 
 - IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
-- If the question wants raw row details (not aggregation), include LIMIT {MAX_ROWS}, unless the user explicitly asks for "all ...".
+- If returning raw rows, include LIMIT {MAX_ROWS}. Put LIMIT at the END of the query (after ORDER BY, if any).
 - If the question is purely conceptual/theory (definitions, explanations) without needing actual table values, return NO_SQL.
 - If the user asks for a chart, graph, plot, distribution, comparison, or "by <something>":
   return an aggregated result suitable for visualization.
@@ -1645,6 +1699,55 @@ def handle_general_data_question(question: str, history=None):
         }
         if DEBUG_SQL:
             result["debug_sql"] = sql_text
+        return result
+    # -------------------------------------------------
+    # ORDER ID OVERRIDE (avoid LLM mistakes with commas + addon rules)
+    order_id = _extract_order_id(question)
+
+    # ONLY force SELECT * if user asked for details
+    if order_id is not None and _wants_full_details(question):
+        ql2 = (question or "").lower()
+        pol = policy_filter_sql(
+            question,
+            already_has_ltype=("ltype" in ql2),
+            already_has_addon=("addon" in ql2),
+        )
+
+        where_parts = [f"OrderId = {int(order_id)}"]
+        if pol:
+            where_parts.append(pol)
+
+        sql_text = f"""
+        SELECT *
+        FROM {TABLE}
+        WHERE {" AND ".join(where_parts)}
+        LIMIT {MAX_ROWS}
+        """.strip()
+
+        df = run_sql_and_fetch_df(sql_text)
+
+        total_rows = len(df)
+        truncated = False
+        df_preview = df
+
+        if MAX_ROWS and total_rows > MAX_ROWS:
+            truncated = True
+            df_preview = df.head(MAX_ROWS)
+
+        df_preview = apply_hidden_cols_policy(df_preview, question)
+        table_html = rows_to_html_table(df_preview.to_dict(orient="records")) if not df_preview.empty else "<p><i>No data</i></p>"
+
+        result = {
+            "reply": f"Here are the results for: {question}" if not df_preview.empty else "No data found for that query.",
+            "table_html": table_html,
+            "plot_data_uri": None,
+            "rows_returned": total_rows,
+            "truncated": truncated,
+            "download_url": None,
+        }
+        if DEBUG_SQL:
+            result["debug_sql"] = sql_text
+
         return result
 
     # 1) Ask model for SQL  (conversation-aware)
@@ -2441,4 +2544,3 @@ if __name__ == "__main__":
         print("Route print failed:", e)
 
     app.run(host="0.0.0.0", port=PORT)
-
