@@ -25,7 +25,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL = os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
+DEBUG_SQL =True
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -2441,3 +2441,4 @@ if __name__ == "__main__":
         print("Route print failed:", e)
 
     app.run(host="0.0.0.0", port=PORT)
+
