@@ -110,6 +110,10 @@ PRED_MESSAGES = [
   {"role":"user","text":"show month wise revenue for the product tv and also estimate the revenue for 2025","time":PRED_CHAT_CREATED_AT+5},
   {"role":"user","text":"what is the disconnected rate and estimated disconnected rate for the provider comcast for dec 2025.","time":PRED_CHAT_CREATED_AT+6},
   {"role":"user","text":"give me the revenue,profit,profit rate and estimated profit rate for the Mainchannel Digital on 2025 from addon","time":PRED_CHAT_CREATED_AT+7},
+  {"role":"user","text":"show me the top 10 product wise installation,installation rate and estimated  installation rate for 2025","time":PRED_CHAT_CREATED_AT+8},
+  {"role":"user","text":"show me the installation and estimated installation based on mainchannel wise on 2025","time":PRED_CHAT_CREATED_AT+7},
+  {"role":"user","text":"show me the top 10 product name, profit and estimated profit on 2025","time":PRED_CHAT_CREATED_AT+8},
+  {"role":"user","text":"show me the top 10 provider name, disconnection orders,disconnected rate and estimated disconnection rate on october 2025","time":PRED_CHAT_CREATED_AT+9}
 ]
 
 PRED_CHAT = {"id":PRED_CHAT_ID,"title":PRED_CHAT_TITLE,"created_at":PRED_CHAT_CREATED_AT,"messages":PRED_MESSAGES}
@@ -554,6 +558,97 @@ def apply_hidden_cols_policy(df: pd.DataFrame, question: str) -> pd.DataFrame:
     if to_drop:
         return df.drop(columns=to_drop, errors="ignore")
     return df
+def extract_groupby_col(question: str):
+    """
+    Detect grouping dimension like:
+      - based on Mainchannel
+      - based on marketing source
+      - package wise
+      - product wise
+      - provider wise
+      - company name wise
+    Returns a real column name from COLS or None.
+    """
+    q = (question or "").strip()
+    ql = q.lower()
+    # Helper: resolve phrases like "company name" -> CompanyName
+    def _resolve_phrase(phrase: str):
+        phrase = (phrase or "").strip().lower()
+        phrase = phrase.replace("marketting", "marketing")
+        phrase = phrase.replace("_", " ").replace("-", " ")
+        phrase = re.sub(r"\s+", " ", phrase).strip()
+        return resolve_col_name(phrase)
+    # Normalize common misspellings
+    ql = ql.replace("marketting", "marketing")
+    # 0) "top N <dimension>" (stop at comma / and / with / metrics)
+    m = re.search(r"\btop\s+\d{1,4}\s+(.+)", ql)
+    if m:
+        phrase = m.group(1).strip()
+
+        # stop at comma / connectors
+        phrase = re.split(r"(,|\band\b|\bwith\b|\bwhere\b|\bfor\b|\bon\b|\bin\b|\blimit\b)", phrase, maxsplit=1)[0].strip()
+
+        # remove metric words if they leaked in
+        phrase = re.split(r"\b(profit|revenue|orders?|installation|disconnection|rate|estimated|estimate|predict|forecast)\b", phrase, maxsplit=1)[0].strip()
+
+        phrase = re.sub(r"[^a-z0-9 _\-]+", " ", phrase).strip()
+        phrase = re.sub(r"\s+", " ", phrase).strip()
+
+        col = _resolve_phrase(phrase)
+        if col:
+            return col
+
+    # 1) "based on X"
+    m = re.search(r"\bbased\s+on\s+([a-zA-Z0-9 _\-]+)", ql)
+    if m:
+        phrase = m.group(1).strip()
+        phrase = re.split(r"\b(on|in|for|where|with|limit|top|month|year)\b", phrase)[0].strip()
+        col = _resolve_phrase(phrase)
+        if col:
+            return col
+
+    # 2) "X wise"  (this was failing for you)
+    m = re.search(r"\b([a-zA-Z0-9 _\-]+?)\s+wise\b", ql)
+    if m:
+        phrase = m.group(1).strip()
+        phrase = re.split(r"\b(on|in|for|where|with|limit|top|month|year)\b", phrase)[0].strip()
+        col = _resolve_phrase(phrase)
+        if col:
+            return col
+
+    # 3) direct keywords: "package wise", "product wise", etc.
+    # (your logs show the regex sometimes doesn't hit correctly, so add explicit checks)
+    direct_map = {
+        "package": ["package"],
+        "product": ["product", "product name"],
+        "provider": ["provider", "provider name"],
+        "marketing source": ["marketing source", "marketingsource", "marketing"],
+        "mainchannel": ["mainchannel", "main channel"],
+        "company name": ["company", "company name"],
+    }
+
+    for canonical, variants in direct_map.items():
+        for v in variants:
+            if re.search(rf"\b{re.escape(v)}\b\s+wise\b", ql):
+                col = _resolve_phrase(canonical)
+                if col:
+                    return col
+
+    return None
+
+def extract_top_n(question: str):
+    ql = (question or "").lower()
+    m = re.search(r"\btop\s+(\d{1,4})\b", ql)
+    if m:
+        return max(1, min(int(m.group(1)), 500))
+    return None
+
+def extract_limit_n(question: str):
+    ql = (question or "").lower()
+    m = re.search(r"\blimit\s+(\d{1,4})\b", ql)
+    if m:
+        return max(1, min(int(m.group(1)), 500))
+    return None
 
 def _extract_order_id(question: str):
     """
@@ -708,9 +803,14 @@ for _c in COLS:
 
 # Optional aliases (small set; you can add more later)
 _ALIAS_MAP = {
-    "package": ["package", "package name", "packagename", "pkg", "pkgname", "order package", "product package"],
+    "package": [
+        "package", "package name", "packagename", "pkg", "pkgname",
+        "order package", "product package",
+        "orderpackage", "order package name", "orderpackagename",
+        "packagecode", "package code"
+    ],
     "mainchannel": ["mainchannel", "main channel", "channel"],
-    "marketingsource": ["marketing source", "marketingsource", "marketing", "source"],
+    "marketingsource": ["marketing source", "marketingsource", "marketing", "source", "marketting source", "markettingsource"],
     "providername": ["provider", "provider name", "providername"],
     "productname": ["product", "product name", "productname"],
 }
@@ -747,6 +847,16 @@ def resolve_col_name(user_phrase: str):
     for c in COLS:
         if nk and nk in _norm_key(c):
             return c
+    # 5) ✅ special fallback for common phrases
+    if nk in ("providername", "providername"):
+        for c in COLS:
+            if _norm_key(c) in ("providername", "provider"):
+                return c
+
+    if nk in ("marketingsource", "marketing source", "marketing"):
+        for c in COLS:
+            if _norm_key(c) in ("marketingsource", "marketingsrc", "source"):
+                return c
 
     return None
 
@@ -808,11 +918,12 @@ def _month_start_end(year: int, month: int):
 
 # --- shared stopwords for entity extraction ---
 _ENTITY_STOPWORDS = (
-    "for|in|on|where|with|month|year|and|or|by|from|to|as|at|of|"
+    "for|in|on|where|with|month|year|and|or|by|from|to|as|at|of|name|"
     "what|whats|is|are|was|were|show|give|tell|find|get|calculate|compute|"
     "profit|revenue|rate|orders|order|installation|install|disconnection|disconnect|"
     "estimate|estimated|forecast|predict|predicted|projection|projected"
 )
+
 # Words/phrases that describe metrics, NOT column filters
 _METRIC_PHRASES = (
     "profit rate",
@@ -824,45 +935,73 @@ _METRIC_PHRASES = (
     # generic "rate" causes most false-positives (profit rate -> Profit + 'rate')
     "rate",
 )
-
-
 def extract_provider(question: str):
     q = (question or "").strip()
-    # allow "provider spectrum" or "provider is spectrum" or "provider = spectrum"
+    ql = q.lower()
+
+    # ✅ If user said "provider wise", that's GROUPING, not filtering
+    if re.search(r"\bprovider\b\s+wise\b", ql) or re.search(r"\bprovider\s+name\b\s+wise\b", ql):
+        return None
+
+    # Prefer explicit "provider name X"
     m = re.search(
-        r"\bprovider\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
+        r"\bprovider\s+name\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
         q,
         flags=re.IGNORECASE
     )
     if not m:
+        # fallback: "provider X"
+        m = re.search(
+            r"\bprovider\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
+            q,
+            flags=re.IGNORECASE
+        )
+    if not m:
         return None
+
     val = (m.group(1) or "").strip()
+
+    # remove leading "name"
+    val = re.sub(r"^\s*name\s+", "", val, flags=re.IGNORECASE).strip()
 
     # cut at stopwords
     val = re.split(rf"\b(?:{_ENTITY_STOPWORDS})\b", val, flags=re.IGNORECASE)[0].strip()
-
-    # keep only first chunk before punctuation that often continues sentence
     val = re.split(r"[,.?;!]", val)[0].strip()
+
+    # extra safety: reject garbage captures
+    if val.lower() in ("wise", "wise installation", "wise instalaltion"):
+        return None
 
     return val if val else None
 
 def extract_product(question: str):
     q = (question or "").strip()
-    # allow "product tv" or "product is tv" or "product = tv"
+    ql = q.lower()
+
+    # If user said "product wise", that's GROUPING, not filtering
+    if re.search(r"\bproduct\b\s+wise\b", ql) or re.search(r"\bproduct\s+name\b\s+wise\b", ql):
+        return None
+
+    # Only treat as filter when explicit operator exists: product is/=/: X
     m = re.search(
-        r"\bproduct\b\s*(?:is|=|:)?\s*([A-Za-z0-9&._\-/ ]{2,80})",
+        r"\bproduct\b\s*(?:is|=|:)\s*([A-Za-z0-9&._\-/ ]{2,80})",
         q,
         flags=re.IGNORECASE
     )
     if not m:
         return None
+
     val = (m.group(1) or "").strip()
 
-    # cut at stopwords
+    # block bad captures like "name"
+    if re.fullmatch(r"name", val.strip(), flags=re.IGNORECASE):
+        return None
+
     val = re.split(rf"\b(?:{_ENTITY_STOPWORDS})\b", val, flags=re.IGNORECASE)[0].strip()
     val = re.split(r"[,.?;!]", val)[0].strip()
 
     return val if val else None
+
 
 def _safe_sql_literal(s: str) -> str:
     return "'" + (s or "").replace("'", "''").strip() + "'"
@@ -975,12 +1114,14 @@ def _extract_generic_filters_anycol(question: str):
     # C) reversed form: "DirecTV package" (keep ONLY for package-ish columns because value-first is risky)
     pkg_col = resolve_col_name("package")
     if pkg_col:
-        pat = re.compile(r"\b([A-Za-z0-9&._\-#/]{2,80})\s+package\b", flags=re.IGNORECASE)
+        pat = re.compile(r"\b([A-Za-z][A-Za-z0-9&._\-#/]{1,79})\s+package\b", flags=re.IGNORECASE)
         for m in pat.finditer(q):
             a, b = m.span()
             if _span_overlaps(a, b):
                 continue
             val = _clean_value(m.group(1))
+            if val.lower() == "top":
+                continue
             if not val:
                 continue
             out.append((pkg_col, val))
@@ -1001,12 +1142,56 @@ def build_prediction_monthly_sql(question: str):
       - NetAfterChargeback (revenue), Profit
     Also supports generic filters like:
       package xyz, mainchannel digital, marketing source google, companystate ca, etc.
+
+    NEW:
+      - If user asks "based on X" or "X wise", we also group by that column (any column),
+        by adding a "group_key" column.
+      - Still includes month always (needed for regression).
     """
     year = extract_year(question)
     month_year = extract_month_year(question)  # (y,m) or None
 
     provider = extract_provider(question)
     product = extract_product(question)
+# --- group by detection (strong + fallback) ---
+    group_col = None
+    try:
+        group_col = extract_groupby_col(question)
+    except Exception:
+        group_col = None
+
+    # ✅ fallback: explicit common phrases (this is what your users actually type)
+    ql = (question or "").lower()
+
+    def _pick_first_existing(cands):
+        for c in cands:
+            if c in COLS:
+                return c
+        return None
+    grouping_intent = (
+        (" top " in f" {ql} ")
+        or (" wise" in ql)
+        or ("based on" in ql)
+        or (" by " in f" {ql} ")
+        or (re.search(r"\btop\s+\d+\b", ql) is not None)
+    )
+
+    if (not group_col) and grouping_intent:
+        if "provider" in ql:
+            group_col = _pick_first_existing(["ProviderName", "Provider", "providername"])
+        elif "product" in ql:
+            group_col = _pick_first_existing(["ProductName", "Product", "productname"])
+        elif "package" in ql:
+            group_col = _pick_first_existing(["Package", "PackageName", "packagename"])
+        elif "main channel" in ql or "mainchannel" in ql:
+            group_col = _pick_first_existing(["MainChannel", "Mainchannel", "mainchannel"])
+        elif "marketing source" in ql or "marketingsource" in ql or "marketing source" in ql:
+            group_col = _pick_first_existing(["MarketingSource", "Marketingsource", "marketingsource"])
+        elif "company" in ql:
+            group_col = _pick_first_existing(["CompanyName", "companyname"])
+
+
+    print("DEBUG group_col:", group_col)
 
     # NEW: generic filters for ANY column names (including multi-word column phrases)
     generic_filters = []
@@ -1061,43 +1246,48 @@ def build_prediction_monthly_sql(question: str):
         )
 
     where_sql = " AND ".join(where) if where else "1=1"
+    group_select_sql = ""
+    group_groupby_sql = ""
+    if group_col and (group_col in COLS):
+        group_select_sql = f", {qident(group_col)} AS group_key"
+        group_groupby_sql = ", 2"
 
     sql = f"""
-SELECT
-  STRFTIME('%Y-%m', CAST(SaleDate AS DATE)) AS month,
+    SELECT
+    STRFTIME('%Y-%m', CAST(SaleDate AS DATE)) AS month{group_select_sql},
 
-  SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
+    SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END) AS total_orders,
 
-  SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) AS installation_orders,
-  ROUND(
-    SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) * 100.0 /
-    NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
-    2
-  ) AS installation_rate,
+    SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) AS installation_orders,
+    ROUND(
+        SUM(CASE WHEN COALESCE(InstalledOrder,0)=1 THEN 1 ELSE 0 END) * 100.0 /
+        NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
+        2
+    ) AS installation_rate,
 
-  SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) AS disconnection_orders,
-  ROUND(
-    SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) * 100.0 /
-    NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
-    2
-  ) AS disconnection_rate,
+    SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) AS disconnection_orders,
+    ROUND(
+        SUM(CASE WHEN TRY_CAST(DisconnectDate AS TIMESTAMP) IS NOT NULL THEN 1 ELSE 0 END) * 100.0 /
+        NULLIF(SUM(CASE WHEN COALESCE(ConfirmedOrder,0)=1 THEN 1 ELSE 0 END), 0),
+        2
+    ) AS disconnection_rate,
 
-  SUM(COALESCE(NetAfterChargeback,0)) AS revenue,
-  SUM(COALESCE(Profit,0)) AS profit,
+    SUM(COALESCE(NetAfterChargeback,0)) AS revenue,
+    SUM(COALESCE(Profit,0)) AS profit,
 
-  ROUND(
-    SUM(COALESCE(Profit,0)) * 100.0 /
-    NULLIF(SUM(COALESCE(NetAfterChargeback,0)), 0),
-    2
-  ) AS profit_rate
+    ROUND(
+        SUM(COALESCE(Profit,0)) * 100.0 /
+        NULLIF(SUM(COALESCE(NetAfterChargeback,0)), 0),
+        2
+    ) AS profit_rate
 
-FROM {TABLE}
-WHERE {where_sql}
-GROUP BY 1
-ORDER BY 1
-""".strip()
+    FROM {TABLE}
+    WHERE {where_sql}
+    GROUP BY 1{group_groupby_sql}
+    ORDER BY 1
+    """.strip()
 
-    return sql, target_filter
+    return sql, target_filter, group_col
 
 
 def _month_to_index(ym: str) -> int:
@@ -1111,13 +1301,25 @@ def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12):
     """
     Adds estimated_<col> using rolling Linear Regression.
     Predicts each month using ONLY previous months.
+
+    UPDATED:
+    - If a grouping column exists (we use "group_key" from build_prediction_monthly_sql),
+      then estimates are computed PER group_key independently.
+    - If no group_key column exists, behavior stays exactly the same as before.
     """
     if df is None or df.empty or "month" not in df.columns:
         return df
 
     df = df.copy()
     df["__t"] = df["month"].astype(str).apply(_month_to_index)
-    df = df.sort_values("__t").reset_index(drop=True)
+
+    has_group = ("group_key" in df.columns)
+
+    # Always sort so rolling window is correct
+    if has_group:
+        df = df.sort_values(["group_key", "__t"]).reset_index(drop=True)
+    else:
+        df = df.sort_values("__t").reset_index(drop=True)
 
     for col in cols_to_estimate:
         est_col = f"estimated_{col}"
@@ -1125,30 +1327,70 @@ def add_estimated_columns(df: pd.DataFrame, cols_to_estimate, window=12):
         if col not in df.columns:
             continue
 
-        y_all = pd.to_numeric(df[col], errors="coerce").values
-        t_all = df["__t"].values
+        # -------------------------------
+        # NO GROUPING (original behavior)
+        # -------------------------------
+        if not has_group:
+            y_all = pd.to_numeric(df[col], errors="coerce").values
+            t_all = df["__t"].values
 
-        for i in range(len(df)):
-            start_i = max(0, i - window)
-            X_hist = t_all[start_i:i]
-            y_hist = y_all[start_i:i]
+            for i in range(len(df)):
+                start_i = max(0, i - window)
+                X_hist = t_all[start_i:i]
+                y_hist = y_all[start_i:i]
 
-            mask = np.isfinite(X_hist) & np.isfinite(y_hist)
-            X_hist = X_hist[mask]
-            y_hist = y_hist[mask]
+                mask = np.isfinite(X_hist) & np.isfinite(y_hist)
+                X_hist = X_hist[mask]
+                y_hist = y_hist[mask]
 
-            if len(X_hist) < 3:
-                continue
+                if len(X_hist) < 3:
+                    continue
 
-            model = LinearRegression()
-            model.fit(X_hist.reshape(-1, 1), y_hist)
+                model = LinearRegression()
+                model.fit(X_hist.reshape(-1, 1), y_hist)
 
-            t_pred = t_all[i]
-            if not np.isfinite(t_pred):
-                continue
+                t_pred = t_all[i]
+                if not np.isfinite(t_pred):
+                    continue
 
-            pred = model.predict(np.array([[t_pred]]))[0]
-            df.loc[i, est_col] = float(pred)
+                pred = model.predict(np.array([[t_pred]]))[0]
+                df.loc[i, est_col] = float(pred)
+
+            df[est_col] = pd.to_numeric(df[est_col], errors="coerce").round(2)
+            continue
+
+        # --------------------------------
+        # GROUPING MODE (per group_key)
+        # --------------------------------
+        # For each group, do the same rolling LR independently
+        for gval, idx in df.groupby("group_key", sort=False).groups.items():
+            idx_list = list(idx)
+
+            t_all = df.loc[idx_list, "__t"].values
+            y_all = pd.to_numeric(df.loc[idx_list, col], errors="coerce").values
+
+            for j in range(len(idx_list)):
+                start_j = max(0, j - window)
+
+                X_hist = t_all[start_j:j]
+                y_hist = y_all[start_j:j]
+
+                mask = np.isfinite(X_hist) & np.isfinite(y_hist)
+                X_hist = X_hist[mask]
+                y_hist = y_hist[mask]
+
+                if len(X_hist) < 3:
+                    continue
+
+                model = LinearRegression()
+                model.fit(X_hist.reshape(-1, 1), y_hist)
+
+                t_pred = t_all[j]
+                if not np.isfinite(t_pred):
+                    continue
+
+                pred = model.predict(np.array([[t_pred]]))[0]
+                df.loc[idx_list[j], est_col] = float(pred)
 
         df[est_col] = pd.to_numeric(df[est_col], errors="coerce").round(2)
 
@@ -1433,30 +1675,30 @@ def handle_general_data_question(question: str, history=None):
     """
     schema_cols = COLS
     qlow = (question or "").lower()
-
     # -------------------------------------------------
     # PREDICTION MODE (bypass LLM SQL and do stable month-wise SQL + ML)
     # -------------------------------------------------
     prediction_mode = is_prediction_request(question)
     if prediction_mode:
         try:
-            pred_sql, target_filter = build_prediction_monthly_sql(question)
+            pred_sql, target_filter, group_col = build_prediction_monthly_sql(question)
             df = run_sql_and_fetch_df(pred_sql)
 
             ql = (question or "").lower()
             cols_to_estimate = []
+            asked_monthwise = any(k in ql for k in ["month wise", "monthwise", "month-wise"])
 
             # Map metric display names to df column names
             # IMPORTANT: keep "profit rate" BEFORE "profit" to avoid wrong matching
             metric_map = {
                 "total orders": "total_orders",
                 "total order": "total_orders",
-
+                "installation": "installation_orders",
                 "installation orders": "installation_orders",
                 "installation order": "installation_orders",
                 "installed orders": "installation_orders",
                 "installed order": "installation_orders",
-
+                "total installation": "installation_orders",
                 "installation rate": "installation_rate",
                 "install rate": "installation_rate",
 
@@ -1468,16 +1710,26 @@ def handle_general_data_question(question: str, history=None):
                 "disconnection rate": "disconnection_rate",
                 "disconnect rate": "disconnection_rate",
                 "disconnected rate": "disconnection_rate",
-
+                "total profit": "profit",
                 "profit rate": "profit_rate",
                 "profit": "profit",
                 "revenue": "revenue",
             }
-
             # Only estimate metrics the user EXPLICITLY requested as estimated/forecast/predicted
             for phrase, col in metric_map.items():
+
+                # ✅ Guard: if user asked "profit rate", do NOT also treat it as "profit"
+                if phrase == "profit":
+                    if re.search(r"\bprofit\s+rate\b", ql):
+                        continue
+
                 if _wants_estimate_for_metric(ql, phrase):
                     cols_to_estimate.append(col)
+
+
+            # Treat "estimated order" / "estimated orders" as "estimated total orders"
+            if re.search(r"\bestimated\s+orders?\b", ql) or re.search(r"\bestimated\s+order\b", ql):
+                cols_to_estimate.append("total_orders")
 
             # dedupe cols_to_estimate (prevents repeated trend lines)
             cols_to_estimate = list(dict.fromkeys(cols_to_estimate))
@@ -1486,6 +1738,8 @@ def handle_general_data_question(question: str, history=None):
             if not cols_to_estimate and _wants_any_estimates(ql):
                 if "installation rate" in ql or "install rate" in ql:
                     cols_to_estimate = ["installation_rate"]
+                elif "installation" in ql:
+                    cols_to_estimate = ["installation_orders"]
                 elif "disconnection rate" in ql or "disconnect rate" in ql or "disconnected rate" in ql:
                     cols_to_estimate = ["disconnection_rate"]
                 elif "profit rate" in ql:
@@ -1495,7 +1749,7 @@ def handle_general_data_question(question: str, history=None):
                 elif "order" in ql or "orders" in ql:
                     cols_to_estimate = ["total_orders"]
                 else:
-                    cols_to_estimate = ["installation_rate"]
+                    cols_to_estimate = ["total_orders"]
 
             window = 12
             df2 = add_estimated_columns(df, cols_to_estimate, window=window)
@@ -1510,68 +1764,168 @@ def handle_general_data_question(question: str, history=None):
                 _, y = target_filter
                 df_out = df_out[df_out["month"].astype(str).str.startswith(f"{y:04d}-")]
 
+            # If grouped and user did NOT ask month-wise, collapse to ONE row per group_key
+            if "group_key" in df_out.columns and not asked_monthwise:
+                # numeric columns to aggregate
+                numeric_cols = [c for c in df_out.columns if c not in ("month", "group_key")]
+
+                rate_cols = [c for c in numeric_cols if c.endswith("_rate")]
+                est_rate_cols = [c for c in numeric_cols if c.startswith("estimated_") and c.endswith("_rate")]
+
+                agg_dict = {}
+                for c in numeric_cols:
+                    if c in rate_cols or c in est_rate_cols:
+                        agg_dict[c] = "mean"     # ✅ rates should be averaged over months
+                    else:
+                        agg_dict[c] = "sum"      # ✅ counts/money summed over months
+
+                collapsed = (
+                    df_out
+                    .groupby("group_key", dropna=False, as_index=False)
+                    .agg(agg_dict)
+                )
+
+                # recompute actual rates from totals
+                if "installation_orders" in collapsed.columns and "total_orders" in collapsed.columns:
+                    collapsed["installation_rate"] = (
+                        collapsed["installation_orders"] * 100.0 /
+                        collapsed["total_orders"].replace({0: np.nan})
+                    ).round(2)
+
+                if "disconnection_orders" in collapsed.columns and "total_orders" in collapsed.columns:
+                    collapsed["disconnection_rate"] = (
+                        collapsed["disconnection_orders"] * 100.0 /
+                        collapsed["total_orders"].replace({0: np.nan})
+                    ).round(2)
+
+                if "profit" in collapsed.columns and "revenue" in collapsed.columns:
+                    collapsed["profit_rate"] = (
+                        collapsed["profit"] * 100.0 /
+                        collapsed["revenue"].replace({0: np.nan})
+                    ).round(2)
+
+                # ✅ recompute estimated profit_rate if possible
+                if "estimated_profit" in collapsed.columns and "estimated_revenue" in collapsed.columns:
+                    collapsed["estimated_profit_rate"] = (
+                        collapsed["estimated_profit"] * 100.0 /
+                        collapsed["estimated_revenue"].replace({0: np.nan})
+                    ).round(2)
+
+                df_out = collapsed
+
+
+            # Figure out sorting metric
+            sort_col = None
+            if "profit rate" in ql:
+                sort_col = "profit_rate"
+            elif "profit" in ql:
+                sort_col = "profit"
+            elif "revenue" in ql:
+                sort_col = "revenue"
+            elif "installation rate" in ql or "install rate" in ql:
+                sort_col = "installation_rate"
+            elif "disconnection rate" in ql or "disconnect rate" in ql:
+                sort_col = "disconnection_rate"
+            elif "order" in ql:
+                sort_col = "total_orders"
+
+            # Apply TOP / LIMIT in prediction mode (supports both "top N" and "limit N")
+            lim = 0
+            topn = extract_top_n(question)  # your helper already exists
+            limn = extract_limit_n(question)  # your helper already exists
+            if topn:
+                lim = topn
+            elif limn:
+                lim = limn
+            # ✅ NEW: default limit for grouped summaries when user didn't specify top/limit
+            if (("group_key" in df_out.columns) and (not asked_monthwise) and (not lim)):
+                lim = 10
+
+            # Sort + limit
+            if sort_col and sort_col in df_out.columns:
+                df_out = df_out.sort_values(sort_col, ascending=False)
+
+            if lim and lim > 0:
+                df_out = df_out.head(lim)
+
             # --------- OUTPUT COLUMN SELECTION (FIXED: no extra columns) ----------
             wants_total_orders = ("total order" in ql) or ("total orders" in ql) or bool(re.search(r"\btotal\s+orders?\b", ql))
 
-            wants_install_orders = any(p in ql for p in ["installation order", "installation orders", "installed order", "installed orders"])
-            wants_install_rate = any(p in ql for p in ["installation rate", "install rate"])
+            wants_install_orders = any(p in ql for p in [
+                "installation order", "installation orders",
+                "installed order", "installed orders",
+                "installation"   # ✅ bare 'installation' means installation_orders
+            ])
+
+            wants_install_rate = any(p in ql for p in ["installation rate", "install rate","installed rate"])
 
             wants_disc_orders = any(p in ql for p in ["disconnection order", "disconnection orders", "disconnected order", "disconnected orders"])
-            wants_disc_rate = any(p in ql for p in ["disconnection rate", "disconnect rate", "disconnected rate"])
+            wants_disc_rate = any(p in ql for p in ["disconnection rate", "disconnect rate", "disconnected rate","disconnectted rate"])
 
             wants_revenue = "revenue" in ql
-            wants_profit = ("profit" in ql)  # includes profit rate too
             wants_profit_rate = ("profit rate" in ql)
+            wants_profit = (re.search(r"\bprofit\b", ql) is not None) and (not wants_profit_rate)
+            # OR even stricter: explicitly detect "profit," / "profit and" / "profit " without "rate"
 
-            base_cols = ["month"]
+            base_cols = []
+
+            has_group = ("group_key" in df_out.columns) or ("group_key" in df2.columns)
+
+            # ✅ Default: if NOT grouped, include month even if user didn't say "month wise"
+            if asked_monthwise or (not has_group):
+                base_cols.append("month")
+
+            if "group_key" in df_out.columns:
+                base_cols.append("group_key")
+            elif "group_key" in df2.columns:
+                base_cols.append("group_key")
 
             # total orders (only if asked OR if its estimate is requested)
             if wants_total_orders or ("total_orders" in cols_to_estimate):
                 base_cols += ["total_orders"]
-                if "total_orders" in cols_to_estimate:
+                if "total_orders" in cols_to_estimate and "estimated_total_orders" in df_out.columns:
                     base_cols += ["estimated_total_orders"]
 
             # installation orders (only if asked OR estimate requested)
             if wants_install_orders or ("installation_orders" in cols_to_estimate):
                 base_cols += ["installation_orders"]
-                if "installation_orders" in cols_to_estimate:
+                if "installation_orders" in cols_to_estimate and "estimated_installation_orders" in df_out.columns:
                     base_cols += ["estimated_installation_orders"]
 
             # installation rate (only if asked OR estimate requested)
             if wants_install_rate or ("installation_rate" in cols_to_estimate):
                 base_cols += ["installation_rate"]
-                if "installation_rate" in cols_to_estimate:
+                if "installation_rate" in cols_to_estimate and "estimated_installation_rate" in df_out.columns:
                     base_cols += ["estimated_installation_rate"]
 
             # disconnection orders (only if asked OR estimate requested)
             if wants_disc_orders or ("disconnection_orders" in cols_to_estimate):
                 base_cols += ["disconnection_orders"]
-                if "disconnection_orders" in cols_to_estimate:
+                if "disconnection_orders" in cols_to_estimate and "estimated_disconnection_orders" in df_out.columns:
                     base_cols += ["estimated_disconnection_orders"]
 
             # disconnection rate (only if asked OR estimate requested)
             if wants_disc_rate or ("disconnection_rate" in cols_to_estimate):
                 base_cols += ["disconnection_rate"]
-                if "disconnection_rate" in cols_to_estimate:
+                if "disconnection_rate" in cols_to_estimate and "estimated_disconnection_rate" in df_out.columns:
                     base_cols += ["estimated_disconnection_rate"]
 
             # revenue (only if asked OR estimate requested)
             if wants_revenue or ("revenue" in cols_to_estimate):
                 base_cols += ["revenue"]
-                if "revenue" in cols_to_estimate:
+                if "revenue" in cols_to_estimate and "estimated_revenue" in df_out.columns:
                     base_cols += ["estimated_revenue"]
 
             # profit (only if asked OR estimate requested)
             if (wants_profit and not wants_profit_rate) or ("profit" in cols_to_estimate):
-                # if user only asked profit rate, don't force profit unless estimated profit requested
                 base_cols += ["profit"]
-                if "profit" in cols_to_estimate:
+                if "profit" in cols_to_estimate and "estimated_profit" in df_out.columns:
                     base_cols += ["estimated_profit"]
 
             # profit rate (only if asked OR estimate requested)
             if wants_profit_rate or ("profit_rate" in cols_to_estimate):
                 base_cols += ["profit_rate"]
-                if "profit_rate" in cols_to_estimate:
+                if "profit_rate" in cols_to_estimate and "estimated_profit_rate" in df_out.columns:
                     base_cols += ["estimated_profit_rate"]
 
             # dedupe while preserving order and keep only existing cols
