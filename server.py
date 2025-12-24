@@ -25,7 +25,7 @@ from sklearn.linear_model import LinearRegression
 # -------------------------------------------------
 load_dotenv()
 
-DEBUG_SQL = os.getenv("DEBUG_SQL", "false").lower() in ("1", "true", "yes")
+DEBUG_SQL = True
 
 TZ = ZoneInfo("Asia/Kolkata")  # user timezone
 
@@ -1168,27 +1168,33 @@ def build_prediction_monthly_sql(question: str):
             if c in COLS:
                 return c
         return None
+
+    dimension_wise = bool(re.search(
+        r"\b(product|provider|package|main\s*channel|mainchannel|marketing\s*source|marketingsource|company)\b\s+wise\b",
+        ql
+    ))
+
     grouping_intent = (
-        (" top " in f" {ql} ")
-        or (" wise" in ql)
+        (re.search(r"\btop\s+\d+\b", ql) is not None)   # top 10 ...
         or ("based on" in ql)
         or (" by " in f" {ql} ")
-        or (re.search(r"\btop\s+\d+\b", ql) is not None)
+        or dimension_wise                                # only dimension wise, NOT month wise
     )
 
     if (not group_col) and grouping_intent:
-        if "provider" in ql:
+        if re.search(r"\bprovider\b\s+wise\b", ql) or re.search(r"\bprovider\s+name\b\s+wise\b", ql):
             group_col = _pick_first_existing(["ProviderName", "Provider", "providername"])
-        elif "product" in ql:
+        elif re.search(r"\bproduct\b\s+wise\b", ql) or re.search(r"\bproduct\s+name\b\s+wise\b", ql):
             group_col = _pick_first_existing(["ProductName", "Product", "productname"])
-        elif "package" in ql:
+        elif re.search(r"\bpackage\b\s+wise\b", ql):
             group_col = _pick_first_existing(["Package", "PackageName", "packagename"])
-        elif "main channel" in ql or "mainchannel" in ql:
+        elif re.search(r"\b(main\s*channel|mainchannel)\b\s+wise\b", ql):
             group_col = _pick_first_existing(["MainChannel", "Mainchannel", "mainchannel"])
-        elif "marketing source" in ql or "marketingsource" in ql or "marketing source" in ql:
+        elif re.search(r"\b(marketing\s*source|marketingsource)\b\s+wise\b", ql):
             group_col = _pick_first_existing(["MarketingSource", "Marketingsource", "marketingsource"])
-        elif "company" in ql:
+        elif re.search(r"\bcompany\b\s+wise\b", ql):
             group_col = _pick_first_existing(["CompanyName", "companyname"])
+
 
 
     print("DEBUG group_col:", group_col)
@@ -1485,7 +1491,7 @@ Business meaning hints (if these columns exist):
 Additional semantic hints:
 {extra_semantics or '- (none)'}
 
-Technical rules:
+ cal rules:
 - When you work with dates, ALWAYS cast the date column to DATE first:
   CAST({date_col} AS DATE)
   (Assume {date_col} is stored as text and must be cast.)
@@ -1518,7 +1524,6 @@ Technical rules:
   2. Aggregate metrics using SUM / COUNT / AVG as appropriate
   3. ORDER BY the aggregated metric (DESC for top, ASC for bottom)
   4. Apply LIMIT N
-
 - Addon/Ltype filtering is handled by the server automatically. Do NOT add any filters on Ltype or Addon unless the user explicitly asks for Ltype=... or Addon=...
 
 - IMPORTANT: If the user asks for estimate/prediction/forecast/projected values, return NO_SQL.
@@ -2898,4 +2903,3 @@ if __name__ == "__main__":
         print("Route print failed:", e)
 
     app.run(host="0.0.0.0", port=PORT)
-
