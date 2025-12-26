@@ -588,6 +588,20 @@ def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
         }
 
     df = df.copy()
+    def _fmt_date_only(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return ""
+        if pd.isna(x):
+            return ""
+        try:
+            # handles Timestamp / datetime / date
+            return pd.to_datetime(x).date().isoformat()
+        except Exception:
+            s = str(x).strip()
+            # if it's like "2025-07-07 00:00:00", keep just the date part
+            if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+                return s[:10]
+            return s
 
     # Common columns (use if present)
     col_orderid  = "OrderId" if "OrderId" in df.columns else None
@@ -620,9 +634,13 @@ def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
             col_package = col_product
 
     col_addon = "Addon" if "Addon" in df.columns else None
-
+    col_ltype = "Ltype" if "Ltype" in df.columns else ("LType" if "LType" in df.columns else None)
     comm_est = "EstimatedCommission" if "EstimatedCommission" in df.columns else None
     comm_recv = "ReceivedCommission" if "ReceivedCommission" in df.columns else None
+    paid_comm = "PaidCommission" if "PaidCommission" in df.columns else None
+    paid_cb   = "PaidChargeBack" if "PaidChargeBack" in df.columns else None
+    paid_call = "PaidCallCommission" if "PaidCallCommission" in df.columns else None
+
     spend_ads = "GoogleAdsCost" if "GoogleAdsCost" in df.columns else None
 
     revenue_col = get_revenue_col()
@@ -653,17 +671,19 @@ def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
             "Order Type": r.get(col_ordertype, "") if col_ordertype else "",
             "Package": r.get(col_package, "") if col_package else "",
             "Addon?": r.get(col_addon, "") if col_addon else "",
+            "Ltype": r.get(col_ltype, "") if col_ltype else "", 
             "Status": r.get(col_status, "") if col_status else "",
-            "Install Date": r.get(inst_col, "") if inst_col else "",
-            "Disconnect Date": r.get(disc_col, "") if disc_col else "",
+            "Install Date": _fmt_date_only(r.get(inst_col, "")) if inst_col else "",
+            "Disconnect Date": _fmt_date_only(r.get(disc_col, "")) if disc_col else "",
         })
     status_df = pd.DataFrame(status_rows)
 
     # Financials table (product-wise)
     fin = df.copy()
-    for c in [comm_est, comm_recv, spend_ads, revenue_col, profit_col]:
+    for c in [comm_est, comm_recv, spend_ads, revenue_col, profit_col, paid_comm, paid_cb, paid_call]:
         if c and c in fin.columns:
             fin[c] = pd.to_numeric(fin[c], errors="coerce").fillna(0.0)
+
 
     # Financials table (package-wise)
     fin_pkg = pd.DataFrame()
@@ -673,27 +693,54 @@ def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
         agg = {}
         if comm_est:    agg[comm_est] = "sum"
         if comm_recv:   agg[comm_recv] = "sum"
-        if spend_ads:   agg[spend_ads] = "sum"
+
+        # NetAfterCB (your current revenue_col)
         if revenue_col: agg[revenue_col] = "sum"
-        if profit_col:  agg[profit_col] = "sum"
+
+        # Paid components for TotalCommission
+        if paid_comm: agg[paid_comm] = "sum"
+        if paid_cb:   agg[paid_cb] = "sum"
+        if paid_call: agg[paid_call] = "sum"
 
         if agg:
             fin_pkg = fin.groupby(group_key, dropna=False).agg(agg).reset_index()
             fin_pkg = fin_pkg.rename(columns={
                 group_key: "Package",
-                comm_est: "Est. Commission",
-                comm_recv: "Received Commission",
-                spend_ads: "Spend (Ads)",
-                revenue_col: "Revenue",
-                profit_col: "Profit"
+                comm_est: "Est Comm",
+                comm_recv: "Received Com",
+                revenue_col: "NetAfterCB",
+                paid_comm: "PaidCommission",
+                paid_cb: "PaidChargeBack",
+                paid_call: "PaidCallCommission",
             })
-    # ✅ ADD DELTA COLUMN (package-wise money explanation)
-    if not fin_pkg.empty:
-        fin_pkg["Delta"] = (
-            fin_pkg.get("Est. Commission", 0)
-            -fin_pkg.get("Received Commission", 0)
-        ).round(2)
 
+            # Delta
+            fin_pkg["Delta"] = (fin_pkg.get("Est Comm", 0) - fin_pkg.get("Received Com", 0)).round(2)
+
+            # TotalCommission = sum of paid components (missing ones treated as 0)
+            fin_pkg["TotalCommission"] = (
+                fin_pkg.get("PaidCommission", 0)
+                + fin_pkg.get("PaidChargeBack", 0)
+                + fin_pkg.get("PaidCallCommission", 0)
+            ).round(2)
+
+            # Profit = NetAfterCB - TotalCommission  ✅ your requested formula
+            fin_pkg["Profit"] = (fin_pkg.get("NetAfterCB", 0) - fin_pkg["TotalCommission"]).round(2)
+
+            # Revenue column (if you don’t have a separate gross revenue column)
+            fin_pkg["Revenue"] = fin_pkg.get("NetAfterCB", 0).round(2)
+
+            # Keep only the columns you want, in the order you want
+            fin_pkg = fin_pkg[[
+                "Package",
+                "Est Comm",
+                "Received Com",
+                "Delta",
+                "NetAfterCB",
+                "TotalCommission",
+                "Profit",
+                "Revenue"
+            ]]
 
     # Totals
     total_profit = float(fin[profit_col].sum()) if profit_col and profit_col in fin.columns else None
@@ -748,11 +795,12 @@ def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
 
     # dates
     if sale_val:
-        lines.append(f"- Sale Date: {sale_val}")
+        lines.append(f"- Sale Date: {_fmt_date_only(sale_val)}")
     if inst_val:
-        lines.append(f"- Install Date: {inst_val}")
+        lines.append(f"- Install Date: {_fmt_date_only(inst_val)}")
     if disc_val:
-        lines.append(f"- Disconnect Date: {disc_val}")
+        lines.append(f"- Disconnect Date: {_fmt_date_only(disc_val)}")
+
 
     if total_rev is not None or total_profit is not None:
         bits = []
@@ -772,9 +820,10 @@ def build_order_or_account_report(df: pd.DataFrame, question: str) -> dict:
         ("Provider", provider_val),
         ("Sales Rep", salesrep_val),
         ("Created By", created_val),
-        ("Sale Date", sale_val),
-        ("Install Date", inst_val),
-        ("Disconnect Date", disc_val),
+        ("Sale Date", _fmt_date_only(sale_val)),
+("Install Date", _fmt_date_only(inst_val)),
+("Disconnect Date", _fmt_date_only(disc_val)),
+
     ]
 
     header_html = "<table class='table' style='width:100%; border-collapse:collapse;'>"
