@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -571,11 +570,14 @@
 
       const title = document.createElement('div');
       title.innerHTML = `<strong>BundleAI:</strong>`;
-      const body = document.createElement('div');
-      body.className = 'bot-content';
-      body.innerHTML = escapeHtml(msg.text || '').replace(/\n/g, '<br>');
       content.appendChild(title);
-      content.appendChild(body);
+
+      if ((msg.text || '').trim()) {
+        const body = document.createElement('div');
+        body.className = 'bot-content';
+        body.innerHTML = escapeHtml(msg.text).replace(/\n/g, '<br>');
+        content.appendChild(body);
+      }
 
       if(msg.table_html){
         const tableWrap = document.createElement('div');
@@ -889,10 +891,23 @@
       const data = await res.json();
       typingDiv.remove();
 
-      const replyText = data.reply || '(no reply)';
       const table_html = data.table_html || '';
       const plot_data_uri = data.plot_data_uri || data.plot_uri || '';
       const download_url = data.download_url || null;
+
+      // Prefer reply if it's a non-empty string
+      let replyText = (typeof data.reply === 'string') ? data.reply.trim() : '';
+
+      // If no text reply but we got a table or plot, keep reply empty (don’t show "(no reply)")
+      if (!replyText && (table_html || plot_data_uri)) {
+        replyText = '';
+      }
+
+      // If truly nothing came back, show a real error message and log
+      if (!replyText && !table_html && !plot_data_uri) {
+        console.warn("Chat response missing reply/table/plot. Full response:", data);
+        replyText = "⚠️ I didn’t get a valid response from the server. Check backend /chat response payload.";
+      }
 
       const botMsg = {
         role:'bot',
@@ -978,11 +993,23 @@
       });
 
       const data = await res.json();
-
-      const replyText = data.reply || '(no reply)';
       const table_html = data.table_html || '';
       const plot_data_uri = data.plot_data_uri || data.plot_uri || '';
       const download_url = data.download_url || null;
+
+      // Prefer reply if it's a non-empty string
+      let replyText = (typeof data.reply === 'string') ? data.reply.trim() : '';
+
+      // If no text reply but we got a table or plot, keep reply empty (don’t show "(no reply)")
+      if (!replyText && (table_html || plot_data_uri)) {
+        replyText = '';
+      }
+
+      // If truly nothing came back, show a real error message and log
+      if (!replyText && !table_html && !plot_data_uri) {
+        console.warn("Chat response missing reply/table/plot. Full response:", data);
+        replyText = "⚠️ I didn’t get a valid response from the server. Check backend /chat response payload.";
+      }
 
       const finalBot = {
         role:'bot',
